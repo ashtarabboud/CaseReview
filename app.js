@@ -6,7 +6,7 @@ import DOMPurify from './vendor/purify.es.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '7';
+const APP_VERSION = '8';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -169,7 +169,7 @@ function logDiag(d, outcome, req) {
 
 // Safari reports a dropped connection as "Load failed"; other browsers say "network" / "fetch".
 const isDropped = (e) => !e?.status && !(e instanceof NeedKey) &&
-  (e instanceof TypeError || e?.name === 'APIConnectionError' || /load failed|network|fetch|connection|aborted/i.test(e?.message || ''));
+  (e instanceof TypeError || e?.name === 'APIConnectionError' || /load failed|network|fetch|connection|aborted|stream ended|ended without/i.test(e?.message || ''));
 
 // Keep the phone screen on during long requests (iOS suspends network when the screen locks).
 async function keepAwake() {
@@ -209,10 +209,13 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
   let useFallbacks = !s.model.startsWith('claude-haiku');
   let upgraded = false;
   let drops = 0;
+  let resumes = 0;
+  let trimNextLead = false;
+  const origMessages = params.messages;
   let text = '';
   const content = [];
   let final;
-  for (let turn = 0; turn < 8; turn++) {
+  for (let turn = 0; turn < 8 + resumes; turn++) {
     const req = { ...params };
     if (useFallbacks) { req.betas = ['server-side-fallback-2026-07-01']; req.fallbacks = 'default'; }
     const before = text;
@@ -221,12 +224,31 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
       const t0 = Date.now(); const diag = { t0, first: 0, last: t0, gap: 0, n: 0 };
       stream.on('streamEvent', () => { const now = Date.now(); if (!diag.first) diag.first = now - t0; diag.gap = Math.max(diag.gap, now - diag.last); diag.last = now; diag.n++; });
       req._diag = diag;
-      stream.on('text', (t) => { text += t; onText?.(text); onProgress?.('writing', text); });
+      stream.on('text', (t) => {
+        if (trimNextLead) { t = t.replace(/^[ \t]+/, ''); if (!t) return; trimNextLead = false; }
+        text += t; onText?.(text); onProgress?.('writing', text);
+      });
       stream.on('thinking', () => onProgress?.('thinking'));
       final = await stream.finalMessage();
+      // A stream that just stops (no finish signal) is a dropped connection, not a finished answer.
+      if (!final.stop_reason) throw new TypeError('Load failed (stream ended early)');
       logDiag(req._diag, 'ok ' + final.stop_reason, req);
     } catch (e) {
       logDiag(req._diag, 'ERROR ' + (e?.status || '') + ' ' + (e?.name || '') + ': ' + (e?.message || e), req);
+      // Phones cut off long connections (~1 min). If Claude had already written part of the
+      // answer, ask it to continue from where it stopped instead of starting over.
+      if (isDropped(e) && !params.output_config?.format && !params.tools && text.length - before.length > 40 && resumes < 10) {
+        resumes++;
+        const cut = Math.max(text.lastIndexOf(' '), text.lastIndexOf('\n')) + 1; // drop only the half-written last word
+        text = text.slice(0, Math.max(cut, before.length));
+        trimNextLead = /[ \t]$/.test(text);
+        onText?.(text);
+        onProgress?.('resume');
+        params.messages = [...origMessages,
+          { role: 'assistant', content: text.trimEnd() },
+          { role: 'user', content: 'Your reply above was cut off by a network glitch. Continue it from exactly where it stops (starting with the next word). Do not repeat anything, and do not add any preamble or mention that you are continuing.' }];
+        turn--; continue;
+      }
       text = before;
       if (e?.status === 400 && useFallbacks && /fallback|beta/i.test(e.message)) { useFallbacks = false; turn--; continue; }
       if (e?.status === 400 && params.thinking?.display && /display|thinking/i.test(e.message)) { delete params.thinking; turn--; continue; }

@@ -1,6 +1,6 @@
 // Network-first service worker: always tries to get the newest version,
 // falls back to the cached copy when offline.
-const CACHE = 'casereview-v7';
+const CACHE = 'casereview-v8';
 const SHELL = [
   './', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-192.png',
