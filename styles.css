@@ -274,3 +274,15 @@ body[data-reading="night"] .propbar { background: #2a2416; border-color: #4a3d20
 .conncheck { flex: 1; display: flex; align-items: center; gap: 10px; border: 0; background: none; font-size: 15px; cursor: pointer; text-align: left; padding: 2px; }
 .conncheck .box { flex: 0 0 24px; height: 24px; border-radius: 7px; border: 2px solid var(--line); display: grid; place-items: center; font-weight: 700; color: var(--brand-ink); }
 .connrow.on .box { background: var(--brand); border-color: var(--brand); }
+
+/* Draft workspace: version reader, sources, redline */
+.briefview h3.bh { text-transform: none; letter-spacing: 0; font-size: .82em; color: var(--rink); text-align: left; margin: 1.6em 0 .8em; }
+.briefview blockquote.bq { margin: 0 1.5em 1.05em; font-size: .92em; line-height: 1.55; color: var(--rink); border-left: 3px solid var(--rsoft); padding-left: .8em; }
+.briefview p.fn, .reader p.fn { font-size: .8em; line-height: 1.5; }
+.briefview sup, .redline sup { font-size: .6em; font-family: -apple-system, sans-serif; color: var(--brand); }
+.srcchip { font: 600 12px -apple-system, sans-serif; border: 1px solid var(--line); background: var(--soft); color: var(--brand); border-radius: 999px; padding: 1px 7px; vertical-align: .2em; cursor: pointer; }
+.redline ins { background: color-mix(in srgb, var(--ok) 22%, transparent); text-decoration: underline; text-decoration-color: var(--ok); }
+.redline del { background: color-mix(in srgb, var(--bad) 18%, transparent); text-decoration: line-through; text-decoration-color: var(--bad); }
+.redline .rl-add, .redline .rl-del { border-left: 3px solid var(--line); padding-left: .6em; }
+.redline .skipnote { text-align: center; font: 13px -apple-system, sans-serif; color: var(--rmuted); }
+a.btn { text-decoration: none; }

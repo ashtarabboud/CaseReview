@@ -3,10 +3,13 @@
 import { Anthropic } from './vendor/anthropic.mjs';
 import { marked } from './vendor/marked.esm.js';
 import DOMPurify from './vendor/purify.es.mjs';
+import { db, uid } from './shared/db.mjs';
+import { buildSections, blocksFromParagraphs, paragraphsFromText, blocksFromMarkup, labeledBrief, applyEdits, diffBlocks, blocksToPlainText, normalize, units } from './shared/brief.mjs';
+import { extractDocxBlocks, buildDocx } from './shared/docx.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '13';
+const APP_VERSION = '14';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -43,37 +46,8 @@ const S = {
 
 /* ============================== Storage (IndexedDB) ============================== */
 
-const db = (() => {
-  let opening;
-  const open = () => opening ||= new Promise((res, rej) => {
-    const r = indexedDB.open('casereview', 1);
-    r.onupgradeneeded = () => {
-      r.result.createObjectStore('projects', { keyPath: 'id' });
-      r.result.createObjectStore('cases', { keyPath: 'id' });
-    };
-    r.onsuccess = () => res(r.result);
-    r.onerror = () => rej(r.error);
-  });
-  const tx = async (store, mode, fn) => {
-    const d = await open();
-    return new Promise((res, rej) => {
-      const t = d.transaction(store, mode);
-      const req = fn(t.objectStore(store));
-      t.oncomplete = () => res(req?.result);
-      t.onerror = () => rej(t.error);
-    });
-  };
-  return {
-    get: (s, id) => tx(s, 'readonly', (st) => st.get(id)),
-    put: (s, o) => tx(s, 'readwrite', (st) => st.put(o)),
-    del: (s, id) => tx(s, 'readwrite', (st) => st.delete(id)),
-    all: (s) => tx(s, 'readonly', (st) => st.getAll()),
-    clear: (s) => tx(s, 'readwrite', (st) => st.clear()),
-  };
-})();
 navigator.storage?.persist?.().catch(() => {});
 
-const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
 const projectCases = async (pid) => (await db.all('cases')).filter((c) => c.projectId === pid);
 const save = (store, o) => { o.updatedAt = Date.now(); return db.put(store, o); };
 
@@ -184,7 +158,7 @@ const upgradeTool = (t) => ({ ...t, type: t.type.replace('web_search_20250305', 
  * One call to Claude, streamed. Handles server-tool pauses, refusal fallback,
  * and a couple of compatibility retries. Returns { text, content, message }.
  */
-async function claude({ system, messages, tools, effort, maxTokens = 32000, format, onText, onProgress }) {
+async function claude({ system, messages, tools, effort, maxTokens = 32000, format, onText, onProgress, clientTools }) {
   const s = S.get();
   if (!s.apiKey) throw new NeedKey();
   const client = new Anthropic({ apiKey: s.apiKey, dangerouslyAllowBrowser: true, maxRetries: 2 });
@@ -200,7 +174,7 @@ async function claude({ system, messages, tools, effort, maxTokens = 32000, form
   };
   const lock = await keepAwake();
   try {
-    return await claudeLoop(client, params, s, { onText, onProgress });
+    return await claudeLoop(client, params, s, { onText, onProgress, clientTools });
   } finally {
     lock?.release?.().catch(() => {});
   }
@@ -208,7 +182,7 @@ async function claude({ system, messages, tools, effort, maxTokens = 32000, form
 
 const CONTINUE_MSG = 'Your reply above was cut off by a network glitch. Continue it from exactly where it stops (starting with the next word). Do not repeat anything, and do not add any preamble or mention that you are continuing.';
 
-async function claudeLoop(client, params, s, { onText, onProgress }) {
+async function claudeLoop(client, params, s, { onText, onProgress, clientTools }) {
   // Server-side fallback: if a safety filter declines, the server reroutes the request.
   let useFallbacks = !s.model.startsWith('claude-haiku');
   let upgraded = false;
@@ -219,7 +193,8 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
   let text = '';
   const content = [];
   let final;
-  for (let turn = 0; turn < 8 + resumes; turn++) {
+  let freshTurn = false; // a new turn after a tool result: separate its text from what came before
+  for (let turn = 0; turn < 16 + resumes; turn++) {
     const req = { ...params };
     if (useFallbacks) { req.betas = ['server-side-fallback-2026-07-01']; req.fallbacks = 'default'; }
     const before = text;
@@ -229,8 +204,9 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
       const stream = client.beta.messages.stream(req);
       stream.on('contentBlock', (b) => { doneBlocks.push(b); curText = ''; });
       stream.on('streamEvent', (ev) => {
-        if (ev.type === 'content_block_start' && ev.index > 0 && ev.content_block?.type === 'text' && text && !/\n\s*$/.test(text)) {
-          text += '\n\n';
+        if (ev.type === 'content_block_start' && ev.content_block?.type === 'text') {
+          if ((ev.index > 0 || freshTurn) && text && !trimNextLead && !/\n\s*$/.test(text)) text += '\n\n';
+          freshTurn = false;
         }
       });
       const t0 = Date.now(); const diag = { t0, first: 0, last: t0, gap: 0, n: 0 };
@@ -251,7 +227,7 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
       // carry on from there (the same way the API resumes a paused turn).
       if (isDropped(e) && params.tools && resumes < 30) {
         const blocks = doneBlocks.map((b) => (b.type === 'text' ? { type: 'text', text: b.text } : b));
-        while (blocks.length && ['server_tool_use', 'thinking', 'redacted_thinking'].includes(blocks.at(-1).type)) blocks.pop();
+        while (blocks.length && ['server_tool_use', 'tool_use', 'thinking', 'redacted_thinking'].includes(blocks.at(-1).type)) blocks.pop();
         const keep = curText.slice(0, Math.max(curText.lastIndexOf(' '), curText.lastIndexOf('\n')) + 1);
         if (keep.trim()) blocks.push({ type: 'text', text: keep.trimEnd() });
         if (blocks.length) {
@@ -303,7 +279,25 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
       throw e;
     }
     content.push(...final.content);
+    // Tools the app runs itself (e.g. opening a case's full text from this device).
+    if (final.stop_reason === 'tool_use' && clientTools) {
+      const results = [];
+      for (const u of final.content.filter((b) => b.type === 'tool_use')) {
+        try {
+          const fn = clientTools[u.name];
+          if (!fn) throw new Error(`Unknown tool ${u.name}`);
+          results.push({ type: 'tool_result', tool_use_id: u.id, content: String(await fn(u.input || {})) });
+        } catch (err) {
+          results.push({ type: 'tool_result', tool_use_id: u.id, content: 'Error: ' + (err.message || err), is_error: true });
+        }
+      }
+      onProgress?.('tool');
+      params.messages = [...params.messages, { role: 'assistant', content: final.content }, { role: 'user', content: results }];
+      freshTurn = true;
+      continue;
+    }
     if (final.stop_reason === 'pause_turn') {
+      freshTurn = true;
       params.messages = [...params.messages, { role: 'assistant', content: final.content }];
       continue;
     }
@@ -658,6 +652,7 @@ const app = $('#app');
 async function route() {
   hideSelbar();
   $('#toast').classList.add('hidden');
+  $('#sheet-root').innerHTML = ''; // a sheet left open must not cover the next screen
   const [path, query = ''] = location.hash.replace(/^#/, '').split('?');
   const q = Object.fromEntries(new URLSearchParams(query));
   const parts = path.split('/').filter(Boolean);
@@ -665,7 +660,9 @@ async function route() {
   try {
     if (parts[0] === 'settings') return viewSettings();
     if (parts[0] === 'p' && parts[2] === 'prop') return await viewProp(parts[1], parts[3]);
-    if (parts[0] === 'p') return await viewProject(parts[1], q.tab || 'points');
+    if (parts[0] === 'p' && parts[2] === 'v') return await viewVersion(parts[1], parts[3]);
+    if (parts[0] === 'p' && parts[2] === 'diff') return await viewDiff(parts[1], parts[3], parts[4]);
+    if (parts[0] === 'p') return await viewProject(parts[1], q.tab || 'points', q);
     if (parts[0] === 'c') return await viewCase(parts[1], q.tab || 'read', q.prop);
     return await viewHome();
   } catch (e) {
@@ -800,6 +797,7 @@ function viewSettings() {
       style,
       h('div', { class: 'row', style: 'margin-top:8px' }, h('button', { class: 'btn slim', onclick: () => { style.value = DEFAULT_STYLE; } }, 'Reset to default'))),
     h('button', { class: 'btn primary big', onclick: doSave }, 'Save settings'),
+    manualCard(),
     h('div', { class: 'section-title' }, 'Connection check'),
     diagCard(),
     h('div', { class: 'section-title' }, 'Backup'),
@@ -871,7 +869,7 @@ function diagCard() {
 }
 
 async function exportBackup() {
-  const data = { version: 1, exportedAt: new Date().toISOString(), projects: await db.all('projects'), cases: await db.all('cases') };
+  const data = { version: 2, exportedAt: new Date().toISOString(), projects: await db.all('projects'), cases: await db.all('cases'), versions: await db.all('versions'), reviews: await db.all('reviews'), kv: await db.all('kv') };
   const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
   const a = h('a', { href: URL.createObjectURL(blob), download: `case-review-backup-${new Date().toISOString().slice(0, 10)}.json` });
   document.body.append(a); a.click(); a.remove();
@@ -883,19 +881,23 @@ async function importBackup(e) {
     const data = JSON.parse(await f.text());
     for (const p of data.projects || []) await db.put('projects', p);
     for (const c of data.cases || []) await db.put('cases', c);
+    for (const v of data.versions || []) await db.put('versions', v);
+    for (const rv of data.reviews || []) await db.put('reviews', rv);
+    for (const k of data.kv || []) await db.put('kv', k);
+    await loadManual();
     toast(`Imported ${(data.projects || []).length} projects`);
   } catch (err) { toast('⚠️ Not a valid backup file'); }
 }
 
 /* ============================== Project ============================== */
 
-async function viewProject(pid, tab) {
+async function viewProject(pid, tab, q = {}) {
   const p = await db.get('projects', pid);
   if (!p) return go('#/');
   if (p.analyzing && Date.now() - (p.updatedAt || 0) > 15 * 60 * 1000) { p.analyzing = false; p.analyzeError = 'The last analysis didn’t finish (the app may have been closed). Try again.'; await save('projects', p); }
   const cases = await projectCases(pid);
   const menu = h('button', { class: 'iconbtn', 'aria-label': 'Project menu', onclick: () => projectMenu(p) }, '⋯');
-  const items = p.quick ? [['cases', 'Cases'], ['research', 'Research chat']] : [['points', 'Points'], ['research', 'Research chat'], ['cases', `Cases (${cases.length})`], ['draft', 'Paragraphs'], ['brief', 'My draft']];
+  const items = p.quick ? [['cases', 'Cases'], ['research', 'Research chat']] : [['points', 'Points'], ['draft', 'Draft & review'], ['research', 'Research chat'], ['cases', `Cases (${cases.length})`], ['brief', 'Uploaded draft']];
   if (p.quick && tab !== 'research') tab = 'cases';
   const main = h('main', {});
   app.replaceChildren(header(p.name, '#/', p.court || null, menu), tabs(items, tab, (k) => `#/p/${pid}?tab=${k}`), main);
@@ -953,23 +955,7 @@ async function viewProject(pid, tab) {
     }
   }
 
-  if (tab === 'draft') {
-    const paras = (p.props || []).filter((x) => x.paragraph);
-    if (!paras.length) {
-      main.append(h('p', { class: 'muted' }, 'Paragraphs you build from your points collect here, in brief order. Open a point and tap “Write the paragraph”.'));
-      return;
-    }
-    const all = paras.map((x) => x.paragraph).join('\n\n');
-    main.append(h('button', { class: 'btn primary big', onclick: () => copyText(all) }, '📋 Copy all paragraphs'));
-    for (const prop of paras) {
-      main.append(h('div', { class: 'card' },
-        h('div', { class: 'small muted' }, prop.section),
-        h('div', { class: 'pre', style: 'margin:8px 0' }, prop.paragraph),
-        h('div', { class: 'row' },
-          h('button', { class: 'btn slim', onclick: () => copyText(prop.paragraph) }, 'Copy'),
-          h('button', { class: 'btn slim', onclick: () => go(`#/p/${pid}/prop/${prop.id}`) }, 'Open point'))));
-    }
-  }
+  if (tab === 'draft') return draftTab(main, p, q);
 
   if (tab === 'research') return researchTab(main, p, cases);
 
@@ -1216,7 +1202,7 @@ function researchTab(main, p, cases) {
     bubble.scrollIntoView({ block: 'end', behavior: 'smooth' });
     try {
       const r = await streamInto(out, {
-        system: [...systemFor(p), { type: 'text', text: `You are my legal research partner for this whole project. Answer research questions, explain the law, brainstorm arguments, anticipate the other side's counterarguments, and find authority. Use web search whenever the answer depends on case law, statutes, rules, or current law — especially in ${p.court || 'my jurisdiction'} — and link your sources. Prefer binding authority. Be clear about what you verified in a source versus what is general knowledge.
+        system: [...withManual(systemFor(p)), { type: 'text', text: `You are my legal research partner for this whole project. Answer research questions, explain the law, brainstorm arguments, anticipate the other side's counterarguments, and find authority. Use web search whenever the answer depends on case law, statutes, rules, or current law — especially in ${p.court || 'my jurisdiction'} — and link your sources. Prefer binding authority. Be clear about what you verified in a source versus what is general knowledge.
 
 ${CASES_JSON_RULE}
 
@@ -1519,8 +1505,9 @@ Give me:
     const live = h('div', { class: 'md' });
     paraOut.replaceChildren(live);
     try {
+      await loadManual();
       const r = await streamInto(live, {
-        system: systemFor(p),
+        system: withManual(systemFor(p)),
         messages: [{ role: 'user', content: `Write the paragraph for my motion that makes this point.
 
 POINT: ${prop.text}
@@ -1529,7 +1516,7 @@ ${prop.synthesis ? 'YOUR COMPARISON OF THE CASES:\n' + prop.synthesis + '\n' : '
 CASES I'VE REVIEWED (use ONLY these):
 ${analyses}
 
-Rules: persuasive, formal motion style that matches the voice of my draft. Bluebook citations with pincites where the opinion text shows them; otherwise put [pin]. Use explanatory parentheticals where helpful. Don't overstate what a case held.
+Rules: follow my brief-writing manual if it's provided; persuasive, formal motion style that matches the voice of my draft; consistent with the rest of my brief. Bluebook citations with pincites where the opinion text shows them; otherwise put [pin]. Use explanatory parentheticals where helpful. Don't overstate what a case held.
 
 Output exactly two parts:
 <paragraph>
@@ -1567,7 +1554,7 @@ async function viewCase(cid, tab, propId) {
   const qs = (t) => `#/c/${cid}?tab=${t}${propId ? '&prop=' + propId : ''}`;
   const menu = h('button', { class: 'iconbtn', 'aria-label': 'Case menu', onclick: () => caseMenu(c) }, '⋯');
   const main = h('main', {});
-  const items = [['read', 'Read'], ['breakdown', 'Break it down'], ...(p.quick ? [] : [['compare', 'Compare'], ['support', 'Support?']]), ['chat', 'Ask'], ['notes', `Notes (${c.annotations?.length || 0})`]];
+  const items = [['read', 'Read'], ['breakdown', 'Break it down'], ...(p.quick ? [] : [['compare', 'Compare'], ['support', 'Support?']]), ['chat', 'Ask'], ['notes', 'Saved']];
   const hdr = header(caseTitle(c), back, [c.citation, c.court, c.year].filter(Boolean).join(' · ') || null, menu);
   hdr.classList.add('compact');
   if (!p.quick && p.props?.length) hdr.append(propBar(p, c, prop, tab));
@@ -1580,7 +1567,7 @@ async function viewCase(cid, tab, propId) {
   if (tab === 'support') return supportTab(main, c, p, prop);
   if (tab === 'compare') return compareTab(main, c, p, prop);
   if (tab === 'chat') return chatTab(main, c, p, prop);
-  if (tab === 'notes') return notesTab(main, c, propId);
+  if (tab === 'notes') return savedTab(main, c, p, propId);
 }
 
 /** Choose which points this case is used for (any number), and which one to pin. */
@@ -2535,7 +2522,606 @@ function notesTab(main, c, propId) {
   }
 }
 
+/* ============================== Brief-writing manual ============================== */
+
+let MANUAL = null; // { key:'manual', name, text, at }
+async function loadManual() {
+  try { MANUAL = (await db.get('kv', 'manual')) || null; } catch { MANUAL = null; }
+  return MANUAL;
+}
+
+function manualBlock() {
+  if (!MANUAL?.text) return null;
+  return {
+    type: 'text',
+    text: `MY BRIEF-WRITING MANUAL — standing instructions for every word you draft or revise (voice, sentence craft, paragraphs, tone, citations, punctuation, formatting). My explicit instructions in a request override it; it overrides your own defaults.\n<manual name="${MANUAL.name || 'manual'}">\n${MANUAL.text}\n</manual>`,
+    cache_control: { type: 'ephemeral' },
+  };
+}
+
+/** Add the manual to a system prompt (right after the explanation-style block). */
+function withManual(blocks) {
+  const m = manualBlock();
+  if (!m) return blocks;
+  return [blocks[0], m, ...blocks.slice(1)];
+}
+
+function manualCard() {
+  const status = h('div', { class: 'small', style: 'margin:6px 0' });
+  const draw = () => {
+    status.replaceChildren(MANUAL?.text
+      ? h('span', {}, '✓ ', h('strong', {}, MANUAL.name || 'Manual'), ` · ${Math.round(MANUAL.text.length / 1000)}k characters · added ${new Date(MANUAL.at).toLocaleDateString()}`)
+      : h('span', { class: 'muted' }, 'No manual yet.'));
+  };
+  draw();
+  const input = h('input', { type: 'file', accept: '.docx,.pdf,.txt,.md', style: 'display:none' });
+  input.addEventListener('change', async () => {
+    const f = input.files[0];
+    if (!f) return;
+    status.textContent = 'Reading ' + f.name + '…';
+    try {
+      const text = await fileToText(f);
+      if (text.length < 200) throw new Error('That file has almost no text.');
+      MANUAL = { key: 'manual', name: f.name.replace(/\.\w+$/, ''), text, at: Date.now() };
+      await db.put('kv', MANUAL);
+      toast('Manual saved — every draft and revision will follow it');
+    } catch (e) { toast('⚠️ ' + e.message, 5000); }
+    draw();
+  });
+  return h('div', { class: 'card' },
+    h('h3', {}, 'Brief-writing manual'),
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'Upload your style manual once. It’s included in every drafting and revision request (and in “Write the paragraph”). It’s stored only on this phone.'),
+    status,
+    h('div', { class: 'row' },
+      h('label', { class: 'btn slim' }, MANUAL?.text ? '↻ Replace' : '📎 Upload manual (Word, PDF, or text)', input),
+      h('button', { class: 'btn slim', onclick: () => { if (!MANUAL?.text) return toast('No manual yet'); sheet(MANUAL.name || 'Manual', h('div', { class: 'pre', style: 'font-size:14px; max-height:65vh; overflow:auto' }, MANUAL.text), []); } }, 'View'),
+      h('button', { class: 'btn slim danger', onclick: async () => { if (!MANUAL || !confirm('Remove the manual from this phone?')) return; await db.del('kv', 'manual'); MANUAL = null; draw(); } }, 'Remove')));
+}
+
+/* ============================== Research file (for drafting) ============================== */
+
+const cap = (t, n) => (t && t.length > n ? t.slice(0, n) + '…' : t || '');
+
+/** Everything already worked out for this project, as one document Claude can build on. */
+function researchFile(p, cases) {
+  const L = ['MY RESEARCH FILE — the analyses I have already run. They are settled work: build on them; do not redo them.', ''];
+  const props = p.props || [];
+  if (props.length) {
+    L.push('POINTS IN MY BRIEF:');
+    for (const x of props) {
+      const cs = (x.caseIds || []).map((id) => cases.find((c) => c.id === id)).filter(Boolean)
+        .map((c) => `${c.id} (${caseTitle(c)}${c.support?.[x.id]?.verdict ? ', support check: ' + c.support[x.id].verdict : ''})`);
+      L.push(`<point id="${x.id}" section="${x.section || ''}"${x.kind === 'research_needed' ? ' needs_research="yes"' : ''}>`);
+      L.push(x.text);
+      if (x.bracket) L.push(`My research note: ${x.bracket}`);
+      if (cs.length) L.push(`Cases for this point: ${cs.join('; ')}`);
+      if (x.synthesis) L.push(`<comparison_of_cases>\n${x.synthesis}\n</comparison_of_cases>`);
+      if (x.paragraph) L.push(`<paragraph_written_for_this_point>\n${x.paragraph}\n</paragraph_written_for_this_point>`);
+      L.push('</point>', '');
+    }
+  }
+  const relevant = cases.filter((c) => c.text || c.breakdown || Object.keys(c.support || {}).length || props.some((x) => (x.caseIds || []).includes(c.id)));
+  if (relevant.length) L.push('CASES (use the id with read_case_text to open the full opinion):');
+  for (const c of relevant) {
+    const pts = props.filter((x) => (x.caseIds || []).includes(c.id)).map((x) => x.id).join(',');
+    L.push(`<case id="${c.id}" name="${caseTitle(c)}" citation="${c.citation || ''}" court="${c.court || ''}" year="${c.year || ''}" full_text_available="${c.text ? 'yes' : 'no'}" points="${pts}">`);
+    if (c.rec?.value) L.push(`Recommendation from my breakdown: ${c.rec.value}`);
+    if (c.breakdown) L.push(`<breakdown>\n${c.breakdown}\n</breakdown>`);
+    for (const [pid, sp] of Object.entries(c.support || {})) L.push(`<support point="${pid}" verdict="${sp.verdict || ''}">\n${sp.text}\n</support>`);
+    for (const [pid, cm] of Object.entries(c.compare || {})) L.push(`<compare point="${pid}">\n${cm.text}\n</compare>`);
+    for (const [pid, g] of Object.entries(c.compareResearch || {})) L.push(`<gap_research point="${pid}">\n${g.text}\n</gap_research>`);
+    if (c.better?.text) L.push(`<better_case_search>\n${c.better.text}\n</better_case_search>`);
+    const notes = (c.annotations || []).map((a) => `- [${({ yellow: 'important', green: 'helps us', red: 'hurts us', blue: 'the rule' })[a.color] || a.color}] “${cap(a.quote, 500)}”${a.note ? ` — my note: ${a.note}` : ''}`);
+    if (notes.length) L.push(`<my_highlights>\n${notes.join('\n')}\n</my_highlights>`);
+    const qa = [];
+    for (let i = 0; i + 1 < (c.chat || []).length; i += 2) qa.push(`Q: ${cap(c.chat[i].display || c.chat[i].content, 300)}\nA: ${cap(c.chat[i + 1].content, 1500)}`);
+    if (qa.length) L.push(`<ask_chat>\n${qa.slice(-6).join('\n\n')}\n</ask_chat>`);
+    L.push('</case>', '');
+  }
+  return L.join('\n');
+}
+
+const DRAFT_RULES = `You are drafting and revising a legal brief with me, inside my case-research app.
+
+1. Follow my brief-writing manual (below) for every word you write: voice, sentence structure, paragraph construction, tone, citations, punctuation, formatting. My explicit instructions in a request override the manual.
+2. Consider the WHOLE brief every time, not just the part you are changing. Keep terms, defined names, party names, and record citations consistent. Use a full citation the first time a case appears in the brief and short forms after (check the whole brief to see what is already cited). Don't repeat what another section already says. Make every paragraph serve the overall argument, and keep transitions and cross-references accurate.
+3. Build on my research file. My saved analyses (breakdowns, support checks, comparisons, gap research, highlights) are settled work — rely on them instead of re-analyzing. Use the read_case_text tool only to confirm a quotation or pin cite, or when the saved analyses don't cover what you need. Never redo an analysis unless I ask.
+4. Never invent cases, quotations, holdings, pin cites, record cites, or facts. If something is missing, write a bracketed placeholder such as [cite], [pin], or [confirm holding].
+5. Track sources: every sentence you write or change that relies on a case must be listed in "sources" with the case id and which saved analysis it came from.`;
+
+const EDIT_FORMAT = `HOW TO RETURN YOUR WORK
+The brief below has an id in [brackets] before every sentence, heading, and block quote. Do not retype the brief. Return only your changes, as edits that point at those ids; the app applies them and shows me the complete updated brief.
+
+First write a short change log in Markdown: one bullet per flagged sentence, comment, or note (cite its id), saying what you changed and why — or why you left it alone. Then end your reply with ONE \`\`\`json block:
+{"edits": [...], "sources": [...]}
+
+Edit types (copy ids exactly):
+- {"op":"replace_sentence","id":"Argument I.A ¶2 S1","text":"the new sentence (or sentences)"}
+- {"op":"delete_sentence","id":"Argument I.A ¶2 S3"}
+- {"op":"insert_sentence_after","id":"Argument I.A ¶2 S1","text":"..."}
+- {"op":"replace_paragraph","id":"Argument I.A ¶2","text":"the whole new paragraph"} — only when restructuring a paragraph
+- {"op":"insert_paragraph_after","id":"Argument I.A ¶2","text":"..."} — the id can also be a section label (e.g. "Argument I.A") to insert right after its heading; start the text with "> " for a block quote
+- {"op":"delete_paragraph","id":"Argument I.A ¶3"}
+- {"op":"replace_heading","id":"Argument I.A","text":"A. The new argumentative heading."}
+- {"op":"insert_section_after","id":"Argument I.A","heading":"B. ...","paragraphs":["...","..."]}
+- {"op":"add_footnote","id":"Argument I.A ¶2 S1","text":"the footnote text"}
+Sources: {"text":"the exact final wording of the sentence","case_id":"<id from my research file>","analysis":"support|breakdown|compare|gaps|better|paragraph|chat|text","point_id":"<point id or empty>"}
+
+Approved (GREEN) sentences are locked: the app rejects edits to them unless a comment on that sentence or a note on its section asks for a change. Prefer sentence-level edits over paragraph rewrites, so my approvals survive.`;
+
+const CASE_TOOL = {
+  name: 'read_case_text',
+  description: 'Open the full text of a case in my research file, by its case id. Use it only to confirm a quotation or pin cite, or when the saved analyses don’t cover what you need.',
+  input_schema: { type: 'object', properties: { case_id: { type: 'string', description: 'The id attribute of a <case> in my research file' } }, required: ['case_id'], additionalProperties: false },
+  strict: true,
+  eager_input_streaming: true,
+};
+
+function caseTool(cases) {
+  return {
+    read_case_text: async (input) => {
+      if (!input || typeof input.case_id !== 'string') throw new Error('case_id must be a string');
+      const c = cases.find((x) => x.id === input.case_id);
+      if (!c) throw new Error(`No case with id ${input.case_id}. Use an id from the research file.`);
+      if (!c.text) return `${caseTitle(c)} has not been pulled yet — only its saved analyses are available.`;
+      return `${caseTitle(c)}${c.citation ? ', ' + c.citation : ''}\n\n${c.text}`;
+    },
+  };
+}
+
+async function draftSystem(p, cases) {
+  await loadManual();
+  const blocks = [{ type: 'text', text: DRAFT_RULES + `\n\nPROJECT: ${p.name}\nCOURT / JURISDICTION: ${p.court || 'not specified'}\nOUR SIDE: ${p.side || 'not specified'}` }];
+  const m = manualBlock();
+  if (m) blocks.push(m);
+  blocks.push({ type: 'text', text: researchFile(p, cases), cache_control: { type: 'ephemeral' } });
+  return blocks;
+}
+
+/* ============================== Versions & sources ============================== */
+
+const versionsOf = async (pid) => (await db.byIndex('versions', 'projectId', pid)).sort((a, b) => a.n - b.n);
+const reviewsOf = async (pid) => (await db.byIndex('reviews', 'projectId', pid)).sort((a, b) => (a.round || 1) - (b.round || 1));
+const SOURCE_LABELS = { upload: 'Your upload', 'from-project-draft': 'The draft you added to this project', 'claude-first': 'Claude’s first draft', 'claude-revision': 'Revised from your review', 'claude-change': 'Your requested change' };
+
+/** Link sentences that cite a project case (by citation or "X v." name) to that case's saved analysis. */
+function citationSources(blocks, cases, props) {
+  const out = [];
+  const keys = cases.map((c) => {
+    const k = [];
+    const core = (c.citation || '').match(/\d+\s+[A-Za-z][A-Za-z.\d ]*?\s+\d+/);
+    if (core) k.push(normalize(core[0]));
+    const m = /^(.+?)\s+v\.\s/.exec(c.name || '');
+    if (m && m[1].length >= 4) k.push(normalize(m[1] + ' v.'));
+    if (/^(?:\d{4}-Ohio-\d+)/.test(c.citation || '')) k.push(normalize(c.citation.match(/\d{4}-Ohio-\d+/)[0]));
+    return { c, k };
+  }).filter((x) => x.k.length);
+  for (const u of units(buildSections(blocks))) {
+    const t = normalize(u.text);
+    for (const { c, k } of keys) {
+      if (!k.some((key) => t.includes(key))) continue;
+      const prop = props.find((x) => (x.caseIds || []).includes(c.id) && c.support?.[x.id]);
+      out.push({ text: u.text, caseId: c.id, caseName: caseTitle(c), kind: prop ? 'support' : c.breakdown ? 'breakdown' : 'text', propId: prop?.id || '' });
+    }
+  }
+  return out;
+}
+
+/** Sources for a new version: unchanged sentences keep theirs; Claude's new ones are added; citations are linked. */
+function mergeSources(blocks, prevSources, claudeSources, cases, props) {
+  const present = new Set([...units(buildSections(blocks))].map((u) => normalize(u.text)));
+  const out = [];
+  const seen = new Set();
+  const add = (s) => {
+    const key = normalize(s.text) + '|' + s.caseId + '|' + s.kind;
+    if (!present.has(normalize(s.text)) || seen.has(key) || !cases.some((c) => c.id === s.caseId)) return;
+    seen.add(key);
+    out.push(s);
+  };
+  for (const s of prevSources || []) add(s);
+  for (const s of claudeSources || []) {
+    const c = cases.find((x) => x.id === s.case_id);
+    if (c) add({ text: s.text, caseId: c.id, caseName: caseTitle(c), kind: s.analysis || 'text', propId: s.point_id || '' });
+  }
+  for (const s of citationSources(blocks, cases, props)) add(s);
+  return out;
+}
+
+async function saveVersion(p, cases, fields) {
+  const vs = await versionsOf(p.id);
+  const prev = vs[vs.length - 1];
+  const v = {
+    id: uid(), projectId: p.id, n: (prev?.n || 0) + 1, createdAt: Date.now(),
+    ...fields,
+  };
+  v.sources = mergeSources(v.blocks, fields.carrySources === false ? [] : prev?.sources, fields.claudeSources, cases, p.props || []);
+  delete v.claudeSources; delete v.carrySources;
+  await db.put('versions', v);
+  return v;
+}
+
+/** Sentences locked by a review: green, with no comment of their own and no note on their section. */
+function lockedFromReview(rv) {
+  const locked = new Set();
+  if (!rv) return locked;
+  for (const sec of rv.sections) {
+    if ((rv.notes[sec.label] || '').trim()) continue;
+    for (const it of sec.items) (it.sids || []).forEach((sid) => { if (rv.marks[sid] === 'green' && !rv.comments[sid]) locked.add(sid); });
+  }
+  return locked;
+}
+
+/* ============================== Drafting jobs ============================== */
+
+let draftJob = null; // { pid, label, el } while Claude is working
+
+async function runDraftJob(p, kind, { version, review, instruction, outEl }) {
+  if (draftJob) { toast('Claude is still working on the last request'); return null; }
+  const cases = await projectCases(p.id);
+  draftJob = { pid: p.id, label: kind };
+  try {
+    const system = await draftSystem(p, cases);
+    let user;
+    if (kind === 'first') {
+      user = `Write a complete first draft of my brief.
+
+WHAT IT IS / MY INSTRUCTIONS: ${instruction || 'A brief on the points in my research file.'}
+
+Use the points in my research file as the backbone, in order, and build on the paragraphs I have already written for points (bring them in line with the manual and the whole brief). Use only cases from my research file; where a point still needs authority, write [cite] and say so in your notes.
+${p.draft ? `\nMy earlier draft, for reference (keep what works):\n<earlier_draft>\n${p.draft}\n</earlier_draft>\n` : ''}
+FORMAT: write the whole brief between <brief> and </brief>. Put "# " before every heading line, a blank line between paragraphs, "> " before each block quote, footnote markers like [^1] in the text, and the footnote bodies as "[^1]: text" lines at the end. Start with the first heading (no caption) unless I asked for one.
+After </brief>, write "## Notes" with what is still missing ([cite] placeholders), assumptions you made, and suggestions. Then end with ONE \`\`\`json block: {"sources":[{"text":"exact sentence","case_id":"...","analysis":"support|breakdown|compare|gaps|better|paragraph|chat|text","point_id":"..."}]}`;
+    } else {
+      const header = `THE CURRENT BRIEF (version ${version.n}), with ids:\n<brief>\n${labeledBrief(version.blocks)}\n</brief>`;
+      if (kind === 'revise') {
+        user = `${header}\n\nMY REVIEW FEEDBACK (round ${review.round}):\n<feedback>\n${review.submitted.text}\n</feedback>\n\nRevise only what I flagged: RED sentences, YELLOW sentences, my sentence comments, and my section notes. Leave everything else exactly as it is, except small changes elsewhere that your edits require for consistency (list those in the change log too). Follow my manual. Consider the whole brief.\n\n${EDIT_FORMAT}`;
+      } else {
+        user = `${header}\n\nMY REQUEST: ${instruction}\n\nMake the changes this request needs, plus anything elsewhere that's needed to keep the brief consistent (list those in the change log). Leave the rest exactly as it is. Follow my manual. Consider the whole brief.\n\n${EDIT_FORMAT}`;
+      }
+    }
+    const status = outEl.closest('.card')?.querySelector('.jobstatus');
+    const r = await streamInto(outEl, {
+      system,
+      messages: [{ role: 'user', content: user }],
+      tools: [CASE_TOOL],
+      clientTools: caseTool(cases),
+      maxTokens: 64000,
+      onProgress: (phase) => { if (status) status.textContent = phase === 'tool' ? 'Reading a case from your research…' : phase === 'resume' ? 'Connection dropped — picking up where it left off…' : phase === 'retry' ? 'Reconnecting…' : 'Writing…'; },
+    });
+    const json = lastJSON(r.text) || {};
+    let v;
+    if (kind === 'first') {
+      const m = r.text.match(/<brief>([\s\S]*?)(?:<\/brief>|$)/);
+      if (!m) throw new Error('Claude’s reply didn’t include the brief. Try again.');
+      const blocks = blocksFromMarkup(m[1]);
+      const notes = stripJSONBlocks(r.text.slice(r.text.indexOf('</brief>') + 8)).trim();
+      v = await saveVersion(p, cases, { source: 'claude-first', instruction, blocks, changeLog: notes, claudeSources: json.sources || [], carrySources: false });
+    } else {
+      if (!Array.isArray(json.edits)) throw new Error('Claude’s reply didn’t include a list of edits, so nothing was changed. Try again.');
+      const locked = kind === 'revise' ? lockedFromReview(review) : new Set();
+      const res = applyEdits(version.blocks, json.edits, { locked });
+      v = await saveVersion(p, cases, {
+        source: kind === 'revise' ? 'claude-revision' : 'claude-change',
+        parentId: version.id, fromReviewId: review?.id || null, instruction: instruction || '',
+        blocks: res.blocks, changeLog: stripJSONBlocks(r.text), applied: res.applied, skipped: res.skipped,
+        claudeSources: json.sources || [],
+      });
+      if (review) { review.revisedVersionId = v.id; await db.put('reviews', review); }
+    }
+    return v;
+  } finally {
+    draftJob = null;
+  }
+}
+
+/* ============================== Draft tab ============================== */
+
+async function importBriefFile(f) {
+  const name = f.name.toLowerCase();
+  if (name.endsWith('.docx')) return extractDocxBlocks(await f.arrayBuffer());
+  return blocksFromParagraphs(paragraphsFromText(await fileToText(f)));
+}
+
+async function newVersionSheet(p, title = 'Add a version of the brief') {
+  const status = h('div', { class: 'small muted' });
+  const state = { blocks: null, name: '' };
+  const input = h('input', { type: 'file', accept: '.docx,.pdf,.txt,.md' });
+  input.addEventListener('change', async () => {
+    const f = input.files[0];
+    if (!f) return;
+    status.textContent = 'Reading ' + f.name + '…';
+    try {
+      state.blocks = await importBriefFile(f);
+      state.name = f.name;
+      const heads = state.blocks.filter((b) => b.type === 'h').length;
+      const fns = state.blocks.filter((b) => b.type === 'fn').length;
+      status.textContent = `✓ ${f.name}: ${state.blocks.length} paragraphs, ${heads} headings${fns ? `, ${fns} footnotes` : ''}`;
+    } catch (e) { status.textContent = '⚠️ ' + e.message; }
+  });
+  const paste = h('textarea', { placeholder: 'Or paste the brief here…' });
+  const ok = await sheet(title, h('div', {},
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'Word (.docx) keeps headings, block quotes, and footnotes best.'),
+    h('label', { class: 'file' }, input, '📎 Upload the brief (Word, PDF, or text)'), status,
+    h('label', { class: 'f' }, 'Paste instead'), paste),
+  [{ label: 'Add version', run: () => !!(state.blocks || paste.value.trim()) || (toast('Upload a file or paste the brief'), false) }]);
+  if (!ok) return null;
+  const blocks = state.blocks || blocksFromParagraphs(paragraphsFromText(paste.value));
+  const cases = await projectCases(p.id);
+  return saveVersion(p, cases, { source: 'upload', note: state.name || 'Pasted', blocks, carrySources: false });
+}
+
+async function exportMenu(p, v) {
+  const cases = await projectCases(p.id);
+  const base = `${p.name.replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '_').slice(0, 50) || 'brief'}_v${v.n}`;
+  const dl = (blob, name) => { const a = h('a', { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove(); };
+  await sheet(`Export version ${v.n}`, h('div', { class: 'stack' },
+    h('button', { class: 'btn big', onclick: () => copyText(blocksToPlainText(v.blocks)) }, '📋 Copy the brief'),
+    h('button', { class: 'btn big', onclick: () => dl(new Blob([buildDocx(v.blocks, { caseNames: cases.map((c) => c.name).filter(Boolean) })], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }), base + '.docx') }, '⬇︎ Word (.docx)'),
+    h('button', { class: 'btn big', onclick: () => dl(new Blob([blocksToPlainText(v.blocks)], { type: 'text/plain' }), base + '.txt') }, '⬇︎ Text (.txt)'),
+    h('p', { class: 'small muted' }, 'The Word file uses Times New Roman 12, double spacing, real footnotes, and italic case names and “Id.” Check court formatting rules before filing.')), []);
+}
+
+async function draftTab(main, p, q) {
+  await loadManual();
+  const vs = await versionsOf(p.id);
+  const rvs = await reviewsOf(p.id);
+  const latest = vs[vs.length - 1];
+  const reviewOf = (v) => rvs.find((r) => r.versionId === v.id);
+
+  if (!MANUAL?.text) {
+    main.append(h('div', { class: 'banner' }, h('strong', {}, 'Add your brief-writing manual. '), 'Every draft and revision follows it once it’s in. ', h('a', { href: '#/settings' }, 'Settings →')));
+  }
+
+  // Working card (shows Claude's progress)
+  const jobOut = h('div', { class: 'md' });
+  const jobCard = h('div', { class: 'card', style: 'display:none' }, h('div', { class: 'row small' }, h('span', { class: 'spin' }), h('strong', { class: 'jobstatus' }, 'Working…')),
+    h('p', { class: 'small muted' }, 'Keep the app open. If the connection drops, it picks up where it left off.'), jobOut);
+  const run = async (kind, opts) => {
+    jobCard.style.display = '';
+    jobCard.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    try {
+      const v = await runDraftJob(p, kind, { ...opts, outEl: jobOut });
+      if (v) {
+        toast(`Version ${v.n} is ready`);
+        if (location.hash.includes(`/p/${p.id}`)) go(`#/p/${p.id}?tab=draft`);
+        route();
+      }
+    } catch (e) {
+      jobCard.querySelector('.jobstatus').textContent = 'Stopped';
+      jobOut.append(h('div', { class: 'err' }, '⚠️ ' + friendlyError(e)));
+      jobCard.querySelector('.spin')?.remove();
+    }
+  };
+
+  if (!vs.length) {
+    main.append(h('div', { class: 'card stack' },
+      h('h3', {}, 'Start the draft'),
+      h('p', { class: 'muted', style: 'margin:0' }, 'Draft → review → revise → review again, all here. Every version is saved.'),
+      h('button', { class: 'btn primary big', onclick: async () => { const v = await newVersionSheet(p, 'Upload your draft'); if (v) route(); } }, '📎 Upload my draft'),
+      p.draft ? h('button', { class: 'btn big', onclick: async () => {
+        const cases = await projectCases(p.id);
+        await saveVersion(p, cases, { source: 'from-project-draft', blocks: blocksFromParagraphs(paragraphsFromText(p.draft)), carrySources: false });
+        route();
+      } }, `📄 Use the draft I added to this project${p.draftName ? ` (${p.draftName})` : ''}`) : null,
+      h('button', { class: 'btn big', onclick: () => firstDraftSheet() }, '✍️ Have Claude write a first draft')), jobCard);
+    return;
+  }
+
+  async function firstDraftSheet() {
+    const t = h('textarea', { placeholder: 'e.g., Memorandum in support of Defendant’s motion to dismiss under Civ.R. 12(B)(6); about 15 pages; lead with the standing argument.' });
+    const ok = await sheet('Claude’s first draft', h('div', {},
+      h('p', { class: 'small muted', style: 'margin-top:0' }, 'Claude writes from your points, the paragraphs you’ve written, and your research file, following your manual.'),
+      h('label', { class: 'f' }, 'What should it be?'), t), [{ label: 'Write it', run: () => true }]);
+    if (ok) run('first', { instruction: t.value.trim() });
+  }
+
+  // ---- Current version
+  const rv = reviewOf(latest);
+  const pending = rvs.find((r) => r.submitted && !r.revisedVersionId);
+  const cur = h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('h3', { class: 'grow', style: 'margin:0' }, `Version ${latest.n}`), h('span', { class: 'badge' }, SOURCE_LABELS[latest.source] || latest.source)),
+    h('div', { class: 'small muted', style: 'margin:4px 0 10px' }, new Date(latest.createdAt).toLocaleString(), rv ? ` · Round ${rv.round} review ${rv.submitted ? 'submitted' : 'in progress'}` : ' · not reviewed yet'));
+  if (pending && pending.versionId === latest.id) {
+    cur.append(h('button', { class: 'btn primary big', onclick: () => run('revise', { version: latest, review: pending }) }, `✏️ Revise from your Round ${pending.round} review`));
+  } else {
+    cur.append(h('a', { class: 'btn primary big', href: `review.html#v=${encodeURIComponent(latest.id)}` }, rv && !rv.submitted ? `🔍 Continue reviewing v${latest.n}` : `🔍 Review v${latest.n}`));
+  }
+  cur.append(h('div', { class: 'btns three', style: 'margin-top:8px' },
+    h('button', { class: 'btn', onclick: () => go(`#/p/${p.id}/v/${latest.id}`) }, '📖 Read'),
+    h('button', { class: 'btn', disabled: vs.length < 2, onclick: () => go(`#/p/${p.id}/diff/${vs[vs.length - 2]?.id}/${latest.id}`) }, '↔︎ Changes'),
+    h('button', { class: 'btn', onclick: () => exportMenu(p, latest) }, '⬇︎ Export')));
+  if (latest.changeLog) cur.append(h('details', { style: 'margin-top:10px' }, h('summary', {}, latest.source === 'claude-first' ? 'Claude’s notes' : 'What Claude changed'), mdEl(latest.changeLog)));
+  if (latest.skipped?.length) {
+    cur.append(h('details', { style: 'margin-top:6px' }, h('summary', {}, `⚠️ ${latest.skipped.length} edit${latest.skipped.length === 1 ? '' : 's'} not applied`),
+      h('ul', { class: 'small' }, latest.skipped.map((s) => h('li', {}, `${s.edit?.op || '?'} ${s.edit?.id || ''}: ${s.reason}`)))));
+  }
+  main.append(cur, jobCard);
+
+  // ---- Ask for a change
+  const ask = h('textarea', { placeholder: 'e.g., Tighten the Introduction to one page. · Draft Section II.B from my research on the standing point. · Make the Conclusion two sentences.' });
+  main.append(h('div', { class: 'card' },
+    h('h3', {}, 'Ask for a change'),
+    ask,
+    h('button', { class: 'btn big', style: 'margin-top:8px', onclick: () => { if (!ask.value.trim()) return toast('Say what to change'); run('change', { version: latest, instruction: ask.value.trim() }); } }, '✨ Make this change (new version)')));
+
+  // ---- History
+  main.append(h('div', { class: 'section-title' }, 'All versions'));
+  for (const v of [...vs].reverse()) {
+    const r = reviewOf(v);
+    const idx = vs.indexOf(v);
+    main.append(h('div', { class: 'card' },
+      h('div', { class: 'row' }, h('strong', { class: 'grow' }, `v${v.n} · ${SOURCE_LABELS[v.source] || v.source}`), r ? h('span', { class: 'badge' }, `Round ${r.round}${r.submitted ? ' ✓' : ''}`) : null),
+      h('div', { class: 'small muted' }, new Date(v.createdAt).toLocaleString(), v.instruction ? ` · “${cap(v.instruction, 80)}”` : '', v.note ? ` · ${v.note}` : ''),
+      h('div', { class: 'row', style: 'margin-top:8px' },
+        h('button', { class: 'btn slim', onclick: () => go(`#/p/${p.id}/v/${v.id}`) }, 'Read'),
+        h('a', { class: 'btn slim', href: `review.html#v=${encodeURIComponent(v.id)}` }, r ? 'Open review' : 'Review'),
+        idx > 0 ? h('button', { class: 'btn slim', onclick: () => go(`#/p/${p.id}/diff/${vs[idx - 1].id}/${v.id}`) }, 'Changes') : null,
+        h('button', { class: 'btn slim', onclick: () => exportMenu(p, v) }, 'Export'))));
+  }
+  main.append(h('button', { class: 'btn big', onclick: async () => { const v = await newVersionSheet(p); if (v) route(); } }, '📎 Upload a new version'));
+
+  // ---- Paragraphs written for points
+  const paras = (p.props || []).filter((x) => x.paragraph);
+  if (paras.length) {
+    main.append(h('details', { class: 'card' }, h('summary', {}, `Paragraphs written for points (${paras.length})`),
+      paras.map((prop) => h('div', { style: 'margin-top:10px' },
+        h('div', { class: 'small muted' }, prop.section),
+        h('div', { class: 'pre', style: 'margin:6px 0' }, prop.paragraph),
+        h('div', { class: 'row' }, h('button', { class: 'btn slim', onclick: () => copyText(prop.paragraph) }, 'Copy'), h('button', { class: 'btn slim', onclick: () => go(`#/p/${p.id}/prop/${prop.id}`) }, 'Open point'))))));
+  }
+
+  // Coming back from the review screen with "Send to drafting assistant": revise right away.
+  if (q.revise && !draftJob) {
+    const r = rvs.find((x) => x.id === q.revise);
+    const v = r && vs.find((x) => x.id === r.versionId);
+    history.replaceState(null, '', `#/p/${p.id}?tab=draft`);
+    if (r && v && r.submitted && !r.revisedVersionId) run('revise', { version: v, review: r });
+  }
+}
+
+/* ============================== Read a version (with ⚖ sources) ============================== */
+
+const ANALYSIS_LABELS = { support: 'Support check', breakdown: 'Break it down', compare: 'Compare', gaps: 'Gap research', better: 'Better-case search', paragraph: 'Paragraph written for the point', chat: 'Ask chat', text: 'Case text' };
+
+async function sourceSheet(text, list) {
+  const cases = await db.all('cases');
+  const body = h('div', {}, h('blockquote', { class: 'quote' }, text));
+  for (const s of list) {
+    const c = cases.find((x) => x.id === s.caseId);
+    let ex = '';
+    if (c) {
+      if (s.kind === 'support' && c.support?.[s.propId]) ex = c.support[s.propId].text;
+      else if (s.kind === 'compare' && c.compare?.[s.propId]) ex = c.compare[s.propId].text;
+      else if (s.kind === 'gaps' && c.compareResearch?.[s.propId]) ex = c.compareResearch[s.propId].text;
+      else if (s.kind === 'better' && c.better) ex = c.better.text;
+      else ex = c.breakdown || '';
+    }
+    const tab = s.kind === 'support' ? 'support' : ['compare', 'gaps'].includes(s.kind) ? 'compare' : ['breakdown', 'better'].includes(s.kind) ? 'breakdown' : 'read';
+    body.append(h('div', { class: 'card' },
+      h('strong', {}, c ? caseTitle(c) : s.caseName || 'Case'), c?.citation ? h('div', { class: 'small muted' }, c.citation) : null,
+      h('div', { class: 'small muted' }, 'From: ' + (ANALYSIS_LABELS[s.kind] || s.kind)),
+      ex ? h('details', { style: 'margin-top:6px' }, h('summary', {}, 'Show the saved analysis'), mdEl(ex)) : null,
+      c ? h('button', { class: 'btn slim', style: 'margin-top:8px', onclick: () => { $('#sheet-root').innerHTML = ''; go(`#/c/${c.id}?tab=${tab}${s.propId ? '&prop=' + s.propId : ''}`); } }, 'Open the case') : null));
+  }
+  await sheet('Where this sentence comes from', body, []);
+}
+
+function briefView(blocks, sources) {
+  const bySent = new Map();
+  for (const s of sources || []) {
+    const k = normalize(s.text);
+    if (!bySent.has(k)) bySent.set(k, []);
+    bySent.get(k).push(s);
+  }
+  const wrap = h('article', { class: 'reader briefview' });
+  applyReader(wrap);
+  const marker = (t) => t.split(/(\[\^\d+\])/).filter(Boolean).map((x) => { const m = /^\[\^(\d+)\]$/.exec(x); return m ? h('sup', {}, m[1]) : x; });
+  const { sections } = buildSections(blocks);
+  for (const sec of sections) {
+    if (sec.kind === 'footnotes') wrap.append(h('h3', {}, 'Footnotes'));
+    for (const it of sec.items) {
+      if (it.type === 'h') { wrap.append(h('h3', { class: 'bh' }, it.text)); continue; }
+      if (it.type === 'q') { wrap.append(h('blockquote', { class: 'bq' }, ...marker(it.text))); continue; }
+      const para = h('p', { class: it.type === 'fn' ? 'fn' : null });
+      if (it.type === 'fn') para.append(h('strong', {}, `${it.n}. `));
+      it.sentences.forEach((s, j) => {
+        if (j) para.append(' ');
+        para.append(h('span', {}, ...marker(s)));
+        const src = bySent.get(normalize(s));
+        if (src) para.append(' ', h('button', { class: 'srcchip', onclick: () => sourceSheet(s, src) }, '⚖'));
+      });
+      wrap.append(para);
+    }
+  }
+  return wrap;
+}
+
+async function viewVersion(pid, vid) {
+  const p = await db.get('projects', pid);
+  const v = await db.get('versions', vid);
+  if (!p || !v) return go(`#/p/${pid}?tab=draft`);
+  const main = h('main', { class: 'reading' });
+  app.replaceChildren(header(`Version ${v.n}`, `#/p/${pid}?tab=draft`, `${p.name} · ${SOURCE_LABELS[v.source] || v.source}`, h('button', { class: 'iconbtn', 'aria-label': 'Export', onclick: () => exportMenu(p, v) }, '⬇︎')), main);
+  const nSrc = (v.sources || []).length;
+  main.append(h('div', { class: 'row', style: 'margin-bottom:10px' },
+    h('a', { class: 'btn slim primary', href: `review.html#v=${encodeURIComponent(v.id)}` }, '🔍 Review this version'),
+    h('span', { class: 'small muted' }, nSrc ? `⚖ marks ${nSrc} sentence${nSrc === 1 ? '' : 's'} linked to your research — tap one to see the case and analysis.` : 'No sentences are linked to saved research yet.')));
+  main.append(briefView(v.blocks, v.sources));
+}
+
+/* ============================== Redline between versions ============================== */
+
+async function viewDiff(pid, aId, bId) {
+  const p = await db.get('projects', pid);
+  const vs = await versionsOf(pid);
+  const A = vs.find((x) => x.id === aId) || vs[vs.length - 2];
+  const B = vs.find((x) => x.id === bId) || vs[vs.length - 1];
+  if (!p || !A || !B) return go(`#/p/${pid}?tab=draft`);
+  const main = h('main', { class: 'reading' });
+  app.replaceChildren(header('What changed', `#/p/${pid}?tab=draft`, `${p.name} · v${A.n} → v${B.n}`), main);
+  const pick = (cur, onChange) => h('select', { onchange: (e) => onChange(e.target.value) }, vs.map((v) => h('option', { value: v.id, selected: v.id === cur.id }, `v${v.n}`)));
+  let onlyChanges = true;
+  const out = h('div', {});
+  const draw = () => {
+    const d = diffBlocks(A.blocks, B.blocks);
+    const counts = { changed: 0, added: 0, removed: 0 };
+    for (const x of d) if (counts[x.kind] != null) counts[x.kind]++;
+    out.replaceChildren(h('p', { class: 'small muted' }, `${counts.changed} paragraphs changed · ${counts.added} added · ${counts.removed} removed`));
+    const art = h('article', { class: 'reader redline' });
+    applyReader(art);
+    let skipped = 0;
+    const flushSkip = () => { if (skipped) { art.append(h('p', { class: 'skipnote' }, `… ${skipped} unchanged paragraph${skipped === 1 ? '' : 's'} …`)); skipped = 0; } };
+    for (const x of d) {
+      if (x.kind === 'same') {
+        if (onlyChanges) { skipped++; continue; }
+        art.append(h(x.b.type === 'h' ? 'h3' : 'p', {}, x.b.text));
+        continue;
+      }
+      flushSkip();
+      if (x.kind === 'added') art.append(h('p', { class: 'rl-add' }, h('ins', {}, x.b.text)));
+      else if (x.kind === 'removed') art.append(h('p', { class: 'rl-del' }, h('del', {}, x.a.text)));
+      else art.append(h('p', {}, x.words.map((w) => (w.t === 'same' ? w.s : h(w.t === 'ins' ? 'ins' : 'del', {}, w.s)))));
+    }
+    flushSkip();
+    out.append(art);
+  };
+  main.append(h('div', { class: 'row', style: 'margin-bottom:10px' },
+    pick(A, (id) => { go(`#/p/${pid}/diff/${id}/${B.id}`); }), h('span', {}, '→'), pick(B, (id) => { go(`#/p/${pid}/diff/${A.id}/${id}`); }),
+    h('label', { class: 'small row', style: 'gap:6px' }, h('input', { type: 'checkbox', checked: true, onchange: (e) => { onlyChanges = e.target.checked; draw(); } }), 'Only show changes')),
+    B.changeLog ? h('details', { class: 'card' }, h('summary', {}, 'What Claude says it changed'), mdEl(B.changeLog)) : null,
+    out);
+  draw();
+}
+
+/* ============================== Saved work for a case ============================== */
+
+async function savedTab(main, c, p, propId) {
+  const props = p.props || [];
+  const section = (title, count, body) => h('details', { class: 'card' }, h('summary', {}, `${title}${count != null ? ` (${count})` : ''}`), body);
+  const items = [];
+  if (c.breakdown) items.push(section('Break it down', null, h('div', {}, c.rec ? recBadge(c.rec.value) : null, mdEl(c.breakdown))));
+  const sup = Object.entries(c.support || {});
+  if (sup.length) items.push(section('Support checks', sup.length, h('div', {}, sup.map(([pid, s]) => h('div', { style: 'margin-top:10px' }, h('div', { class: 'small muted' }, props.find((x) => x.id === pid)?.text || 'Point'), verdictBadge(s.verdict), mdEl(s.text))))));
+  const cmp = Object.entries(c.compare || {});
+  if (cmp.length) items.push(section('Compare', cmp.length, h('div', {}, cmp.map(([pid, s]) => h('div', { style: 'margin-top:10px' }, h('div', { class: 'small muted' }, props.find((x) => x.id === pid)?.text || 'Point'), mdEl(s.text))))));
+  const gaps = Object.entries(c.compareResearch || {});
+  if (gaps.length) items.push(section('Gap research', gaps.length, h('div', {}, gaps.map(([, s]) => mdEl(s.text)))));
+  if (c.better?.text) items.push(section('Better-case search', null, mdEl(c.better.text)));
+  const qa = Math.floor((c.chat || []).length / 2);
+  if (qa) items.push(section('Ask chat', qa, h('div', {}, (c.chat || []).map((m) => (m.role === 'user' ? h('p', {}, h('strong', {}, 'Q: '), m.display || m.content) : mdEl(m.content))))));
+  const paras = props.filter((x) => (x.caseIds || []).includes(c.id) && x.paragraph);
+  if (paras.length) items.push(section('Paragraphs written for its points', paras.length, h('div', {}, paras.map((x) => h('div', { class: 'pre', style: 'margin-top:8px' }, x.paragraph)))));
+  const vs = await versionsOf(p.id);
+  const latest = vs[vs.length - 1];
+  const used = (latest?.sources || []).filter((s) => s.caseId === c.id);
+  if (used.length) items.push(section(`Used in draft v${latest.n}`, used.length, h('ul', {}, used.map((s) => h('li', { class: 'small' }, s.text, h('span', { class: 'muted' }, ` — ${ANALYSIS_LABELS[s.kind] || s.kind}`))))));
+  main.append(h('p', { class: 'small muted' }, 'Everything you’ve worked out on this case. The drafting assistant reads all of it and builds on it instead of redoing it.'));
+  if (items.length) main.append(...items); else main.append(h('p', { class: 'muted' }, 'No saved analyses yet.'));
+  main.append(h('div', { class: 'section-title' }, 'Highlights & notes'));
+  notesTab(main, c, propId);
+}
+
 /* ============================== Start ============================== */
 
 marked.setOptions({ gfm: true, breaks: false });
-route();
+loadManual().finally(route);

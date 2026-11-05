@@ -1,0 +1,5 @@
+# Never commit real documents, manuals, or backups (this repository is public)
+*.docx
+*.doc
+*.pdf
+*backup*.json

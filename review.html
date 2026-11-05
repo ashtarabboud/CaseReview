@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Privacy lock (from ReviewBuddy): this screen may load only the app's own files and may not open any network connection. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; manifest-src 'self'; worker-src 'self'; connect-src 'none'; font-src 'none'; media-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Case Review">
+  <title>Review · Case Review</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="stylesheet" href="review/review.css">
+  <script type="module" src="review/review.js"></script>
+</head>
+<body>
+  <header class="topbar" id="topbar">
+    <div class="topbar-row">
+      <button class="icon-btn" id="btn-menu" type="button" aria-label="Reviews and settings">☰</button>
+      <div class="title-wrap">
+        <div class="doc-title" id="doc-title">Review</div>
+        <div class="doc-status" id="doc-status">Private · nothing leaves this screen</div>
+      </div>
+      <button class="icon-btn" id="btn-undo" type="button" aria-label="Undo last highlight" disabled>↶</button>
+      <button class="btn primary" id="btn-export" type="button" disabled>Submit</button>
+    </div>
+    <div class="topbar-row second" id="topbar-second" hidden>
+      <label class="sr-only" for="jump">Jump to section</label>
+      <select id="jump"></select>
+      <div class="progress" id="progress" aria-live="polite"></div>
+    </div>
+  </header>
+
+  <main id="main">
+    <noscript><p class="panel">The review screen needs JavaScript enabled.</p></noscript>
+  </main>
+
+  <input type="file" id="file-input" class="sr-only" accept=".docx,.txt,.md,.json,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,application/json">
+
+  <dialog id="dlg-library" class="sheet">
+    <div class="sheet-head"><h2>Reviews</h2><button class="icon-btn" data-close type="button" aria-label="Close">✕</button></div>
+    <div id="library-body"></div>
+  </dialog>
+
+  <dialog id="dlg-export" class="sheet">
+    <div class="sheet-head"><h2>Submit review</h2><button class="icon-btn" data-close type="button" aria-label="Close">✕</button></div>
+    <p class="hint">Structured feedback for every section, with each highlighted sentence identified by section, paragraph (¶) and sentence (S) number.</p>
+    <div id="send-row" class="btn-row" hidden>
+      <button class="btn primary big" id="btn-send" type="button">Send to drafting assistant</button>
+      <p class="hint">Claude revises only what you flagged, keeps green sentences word-for-word, and returns the full updated brief as your next round.</p>
+    </div>
+    <label class="check"><input type="checkbox" id="opt-green-text"> Include full text of approved (green) sentences</label>
+    <label class="check"><input type="checkbox" id="opt-instructions" checked> Include instructions for the next round</label>
+    <textarea id="export-text" readonly rows="12" aria-label="Feedback preview"></textarea>
+    <div class="btn-row">
+      <button class="btn" id="btn-copy" type="button">Copy feedback</button>
+      <button class="btn" id="btn-share" type="button" hidden>Share…</button>
+      <button class="btn" id="btn-save-txt" type="button">Save .txt</button>
+      <button class="btn" id="btn-save-json" type="button">Save backup (.json)</button>
+    </div>
+    <p class="hint">Copying or sharing hands the text to whatever app you choose. This review screen itself never sends anything.</p>
+  </dialog>
+
+  <dialog id="dlg-comment" class="sheet small">
+    <div class="sheet-head"><h2 id="comment-title">Sentence comment</h2><button class="icon-btn" data-close type="button" aria-label="Close">✕</button></div>
+    <blockquote id="comment-sentence"></blockquote>
+    <textarea id="comment-text" rows="4" placeholder="What should change in this sentence?"></textarea>
+    <div class="btn-row">
+      <button class="btn primary" id="btn-comment-save" type="button">Save</button>
+      <button class="btn danger" id="btn-comment-delete" type="button">Remove comment</button>
+    </div>
+  </dialog>
+
+  <dialog id="dlg-src" class="sheet">
+    <div class="sheet-head"><h2>Where this sentence comes from</h2><button class="icon-btn" data-close type="button" aria-label="Close">✕</button></div>
+    <div id="src-body"></div>
+  </dialog>
+
+  <dialog id="dlg-paste" class="sheet">
+    <div class="sheet-head"><h2>Paste document text</h2><button class="icon-btn" data-close type="button" aria-label="Close">✕</button></div>
+    <label class="field">Name<input type="text" id="paste-name" value="Pasted draft" autocomplete="off"></label>
+    <textarea id="paste-text" rows="12" placeholder="Paste the full brief here…"></textarea>
+    <div class="btn-row"><button class="btn primary" id="btn-paste-load" type="button">Load for review</button></div>
+  </dialog>
+
+  <dialog id="dlg-round" class="sheet">
+    <div class="sheet-head"><h2>Revised draft?</h2><button class="icon-btn" data-close type="button" aria-label="Close">✕</button></div>
+    <p class="hint">If this is a revision of a draft you already reviewed, your green approvals are kept on sentences that did not change and new or rewritten sentences are marked.</p>
+    <div id="round-options"></div>
+    <div class="btn-row"><button class="btn" id="btn-round-new" type="button">No — start a new, separate review</button></div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
