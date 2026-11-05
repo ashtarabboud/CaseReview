@@ -151,6 +151,20 @@ function friendlyError(e) {
   return e?.message || String(e);
 }
 
+// ---- Connection diagnostics (kept on this device; shown in Settings) ----
+function logDiag(d, outcome, req) {
+  if (!d) return;
+  try {
+    const log = JSON.parse(localStorage.getItem('cr.diag') || '[]');
+    log.unshift({
+      at: new Date(d.t0).toLocaleTimeString(), secs: ((Date.now() - d.t0) / 1000).toFixed(1),
+      firstByte: (d.first / 1000).toFixed(1), maxGap: (d.gap / 1000).toFixed(1), events: d.n,
+      size: Math.round(JSON.stringify(req.messages).length / 1000) + 'k', outcome: String(outcome).slice(0, 200),
+    });
+    localStorage.setItem('cr.diag', JSON.stringify(log.slice(0, 25)));
+  } catch {}
+}
+
 // Safari reports a dropped connection as "Load failed"; other browsers say "network" / "fetch".
 const isDropped = (e) => !e?.status && !(e instanceof NeedKey) &&
   (e instanceof TypeError || e?.name === 'APIConnectionError' || /load failed|network|fetch|connection|aborted/i.test(e?.message || ''));
@@ -202,10 +216,15 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
     const before = text;
     try {
       const stream = client.beta.messages.stream(req);
+      const t0 = Date.now(); const diag = { t0, first: 0, last: t0, gap: 0, n: 0 };
+      stream.on('streamEvent', () => { const now = Date.now(); if (!diag.first) diag.first = now - t0; diag.gap = Math.max(diag.gap, now - diag.last); diag.last = now; diag.n++; });
+      req._diag = diag;
       stream.on('text', (t) => { text += t; onText?.(text); onProgress?.('writing', text); });
       stream.on('thinking', () => onProgress?.('thinking'));
       final = await stream.finalMessage();
+      logDiag(req._diag, 'ok ' + final.stop_reason, req);
     } catch (e) {
+      logDiag(req._diag, 'ERROR ' + (e?.status || '') + ' ' + (e?.name || '') + ': ' + (e?.message || e), req);
       text = before;
       if (e?.status === 400 && useFallbacks && /fallback|beta/i.test(e.message)) { useFallbacks = false; turn--; continue; }
       if (e?.status === 400 && params.thinking?.display && /display|thinking/i.test(e.message)) { delete params.thinking; turn--; continue; }
@@ -641,6 +660,8 @@ function viewSettings() {
       style,
       h('div', { class: 'row', style: 'margin-top:8px' }, h('button', { class: 'btn slim', onclick: () => { style.value = DEFAULT_STYLE; } }, 'Reset to default'))),
     h('button', { class: 'btn primary big', onclick: doSave }, 'Save settings'),
+    h('div', { class: 'section-title' }, 'Connection check'),
+    diagCard(),
     h('div', { class: 'section-title' }, 'Backup'),
     h('div', { class: 'card stack' },
       h('p', { class: 'small muted', style: 'margin:0' }, 'Your projects live only on this device. Export a backup now and then (and to move to another device).'),
@@ -659,6 +680,34 @@ function viewSettings() {
     } catch (err) { toast('⚠️ ' + friendlyError(err), 5000); }
     done();
   }
+}
+
+function diagCard() {
+  const list = h('div', { class: 'small kbd', style: 'white-space:pre-wrap; margin-top:10px' });
+  const draw = () => {
+    const log = JSON.parse(localStorage.getItem('cr.diag') || '[]');
+    list.textContent = log.length
+      ? log.map((d) => `${d.at} · ${d.secs}s · 1st ${d.firstByte}s · gap ${d.maxGap}s · ${d.events} ev · ${d.size}\n  ${d.outcome}`).join('\n')
+      : 'No requests logged yet.';
+  };
+  draw();
+  const btn = h('button', { class: 'btn', onclick: async () => {
+    const done = busy(btn, 'Testing… (about 1–2 min, keep the app open)');
+    try {
+      await claude({
+        system: 'You are a test.',
+        messages: [{ role: 'user', content: 'Write a numbered list of 60 different well-known U.S. Supreme Court cases, each with a 3-sentence plain-English summary. This is a connection test.' }],
+        effort: 'low', maxTokens: 16000,
+      });
+      toast('✓ Long request finished fine');
+    } catch (e) { toast('⚠️ ' + friendlyError(e), 5000); }
+    done(); draw();
+  } }, '📶 Run a long connection test');
+  return h('div', { class: 'card' },
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'If things keep failing, run this test, then screenshot the log below and send it to whoever is helping you. (Costs about 5 cents.)'),
+    h('div', { class: 'row' }, btn, h('button', { class: 'btn slim', onclick: draw }, 'Refresh log')),
+    h('div', { class: 'small muted', style: 'margin-top:8px' }, 'App mode: ' + (matchMedia('(display-mode: standalone)').matches || navigator.standalone ? 'Home Screen app' : 'Browser tab')),
+    list);
 }
 
 async function exportBackup() {
@@ -834,45 +883,68 @@ const PROPS_SCHEMA = {
   },
 };
 
+function splitDraft(text, max = 6000) {
+  const paras = text.split(/\n(?=\s*\S)/);
+  const parts = [];
+  let cur = '';
+  for (const para of paras) {
+    if (cur && cur.length + para.length > max) { parts.push(cur); cur = ''; }
+    cur += (cur ? '\n' : '') + para;
+  }
+  if (cur.trim()) parts.push(cur);
+  return parts;
+}
+
 async function analyzeDraft(pid, rebuild = false) {
   const p = await db.get('projects', pid);
   if (!p?.draft) return;
   p.analyzing = true; p.analyzeError = '';
   await save('projects', p);
   if (location.hash.startsWith('#/p/' + pid)) route();
-  try {
+  // Several short requests instead of one long one: phones drop long-running connections.
+  const parts = splitDraft(p.draft);
+  const results = new Array(parts.length);
+  let doneCount = 0;
+  const status = (msg) => { const el = document.getElementById('analyze-status'); if (el) el.textContent = msg; };
+  const system = [
+    { type: 'text', text: 'You are a meticulous litigation associate who maps briefs into their legal building blocks.' },
+    { type: 'text', text: `THE FULL DRAFT BRIEF (for context):\n<brief>\n${p.draft}\n</brief>`, cache_control: { type: 'ephemeral' } },
+  ];
+  const runPart = async (i) => {
     const r = await claude({
-      system: 'You are a meticulous litigation associate who maps briefs into their legal building blocks.',
-      messages: [{ role: 'user', content: `Here is my draft brief/motion. Go through it in order and break it into PROPOSITIONS: each distinct legal point that is (or should be) supported by case law.
+      system,
+      messages: [{ role: 'user', content: `Go through EXCERPT ${i + 1} of ${parts.length} of my brief (below) and break it into PROPOSITIONS: each distinct legal point that is (or should be) supported by case law. Use the full brief above only for context (section headings, resolving "Id." and short cites). Only list points whose main statement is inside this excerpt.
 
 For each proposition:
 - section: the heading it falls under in the brief.
 - text: the proposition in one or two plain sentences, faithful to what I wrote.
 - kind: "cited" if I cite case law for it; "research_needed" if it has a bracket or placeholder asking for research (e.g. [find a case that says…], [cite], [confirm cite], [add support], TK, ??), or it is a legal assertion with no authority at all.
 - bracket: the exact bracketed note, if any (else "").
-- citations: every CASE cited for that point (case name, the full citation as written, pincite if given). Use "Id."/short cites resolved to the full case. Skip statutes and rules here.
+- citations: every CASE cited for that point (case name, full citation, pincite if given), with short cites resolved to the full case. Skip statutes and rules.
 
-Keep the brief's order. Don't merge different points; don't split one point into many.
+Keep the brief's order. Don't merge different points; don't split one point into many. If the excerpt has no legal propositions (e.g. caption, signature block), return an empty list.
 
-<brief>
-${p.draft}
-</brief>` }],
+<excerpt>
+${parts[i]}
+</excerpt>` }],
       format: { type: 'json_schema', schema: PROPS_SCHEMA },
-      maxTokens: 64000,
+      maxTokens: 32000,
       effort: 'low',
-      onProgress: (phase, text) => {
-        const el = document.getElementById('analyze-status');
-        if (!el) return;
-        if (phase === 'retry') el.textContent = 'Connection dropped — retrying…';
-        else if (phase === 'thinking') el.textContent = 'Reading your draft…';
-        else el.textContent = `Found ${(text.match(/"section"/g) || []).length} points so far…`;
-      },
     });
-    const data = JSON.parse(r.text);
+    results[i] = JSON.parse(r.text);
+    doneCount++;
+    const found = results.filter(Boolean).reduce((n, x) => n + x.propositions.length, 0);
+    status(`Done with part ${doneCount} of ${parts.length} — ${found} points so far…`);
+  };
+  try {
+    status(`Reading your draft in ${parts.length} part${parts.length > 1 ? 's' : ''}…`);
+    // First part alone (it warms the cache), then the rest 3 at a time.
+    await runPart(0);
+    const queue = parts.map((_, i) => i).slice(1);
+    await Promise.all([0, 1, 2].map(async () => { while (queue.length) await runPart(queue.shift()); }));
     const fresh = await db.get('projects', pid);
     const old = rebuild ? [] : (fresh.props || []);
-    const props = data.propositions.map((x) => ({ id: uid(), section: x.section, text: x.text, kind: x.kind, bracket: x.bracket, citations: x.citations, caseIds: [] }));
-    // Link (and create placeholders for) the cases cited for each point.
+    const props = results.flatMap((d) => d.propositions).map((x) => ({ id: uid(), section: x.section, text: x.text, kind: x.kind, bracket: x.bracket, citations: x.citations, caseIds: [] }));
     for (const prop of props) {
       for (const cit of prop.citations) {
         if (!cit.citation && !cit.case_name) continue;
@@ -881,8 +953,9 @@ ${p.draft}
       }
     }
     fresh.props = [...old, ...props];
-    if (!fresh.court && data.court) fresh.court = data.court;
-    if ((!fresh.name || fresh.name === fresh.draftName || fresh.name === 'Untitled brief') && data.title) fresh.name = data.title;
+    const meta = results[0];
+    if (!fresh.court && meta.court) fresh.court = meta.court;
+    if ((!fresh.name || fresh.name === fresh.draftName || fresh.name === 'Untitled brief') && meta.title) fresh.name = meta.title;
     fresh.analyzing = false;
     await save('projects', fresh);
     toast(`Found ${props.length} points`);
