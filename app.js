@@ -1,0 +1,1585 @@
+// Case Review — a phone-friendly case law reader & brief assistant.
+// Everything (your API key, drafts, cases, notes) is stored only on this device.
+import { Anthropic } from './vendor/anthropic.mjs';
+import { marked } from './vendor/marked.esm.js';
+import DOMPurify from './vendor/purify.es.mjs';
+
+/* ============================== Settings ============================== */
+
+const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
+
+- Explain it like I'm smart but brand new to the topic ("explain it like I'm five" clarity) without dumbing down the law.
+- Define every legal term the first time you use it, in plain English. Example: "**Pleading standard** — the minimum a complaint has to say to survive a motion to dismiss."
+- Show the logic step by step: "If X, then Y, because Z." Never jump from point A to point C without showing point B. Don't assume I already know what something means.
+- Use a short, concrete hypothetical when it helps something click.
+- Write in short, clear paragraphs and simple lists. Not bare-bones fragments, and not thick, dense blocks of text.
+- Always separate (1) what the court actually HELD, (2) what it said in passing (dicta), and (3) your own interpretation.
+- Tell me what the court based its reasoning on (statute, prior cases, policy, specific facts).
+- Be honest: if a case doesn't really support my point, say so plainly and explain why.`;
+
+const BASE_RULES = `
+
+Ground rules (always follow):
+- Never invent cases, quotes, holdings, citations, or page numbers. Quote the opinion word-for-word when you quote it.
+- If the opinion text shows star pages (like *123) use them for pincites; otherwise write "[pin — check Westlaw]".
+- Format answers in Markdown with clear headings and short lists.`;
+
+const MODELS = [
+  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5 — best reasoning (default)' },
+  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5 — faster, about half the cost' },
+  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5 — fastest, cheapest' },
+];
+
+const DEFAULTS = { apiKey: '', clToken: '', model: 'claude-opus-5-5', effort: 'medium', style: DEFAULT_STYLE };
+const S = {
+  get() {
+    try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('cr.settings') || '{}') }; }
+    catch { return { ...DEFAULTS }; }
+  },
+  set(patch) { localStorage.setItem('cr.settings', JSON.stringify({ ...S.get(), ...patch })); },
+};
+
+/* ============================== Storage (IndexedDB) ============================== */
+
+const db = (() => {
+  let opening;
+  const open = () => opening ||= new Promise((res, rej) => {
+    const r = indexedDB.open('casereview', 1);
+    r.onupgradeneeded = () => {
+      r.result.createObjectStore('projects', { keyPath: 'id' });
+      r.result.createObjectStore('cases', { keyPath: 'id' });
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  const tx = async (store, mode, fn) => {
+    const d = await open();
+    return new Promise((res, rej) => {
+      const t = d.transaction(store, mode);
+      const req = fn(t.objectStore(store));
+      t.oncomplete = () => res(req?.result);
+      t.onerror = () => rej(t.error);
+    });
+  };
+  return {
+    get: (s, id) => tx(s, 'readonly', (st) => st.get(id)),
+    put: (s, o) => tx(s, 'readwrite', (st) => st.put(o)),
+    del: (s, id) => tx(s, 'readwrite', (st) => st.delete(id)),
+    all: (s) => tx(s, 'readonly', (st) => st.getAll()),
+    clear: (s) => tx(s, 'readwrite', (st) => st.clear()),
+  };
+})();
+navigator.storage?.persist?.().catch(() => {});
+
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+const projectCases = async (pid) => (await db.all('cases')).filter((c) => c.projectId === pid);
+const save = (store, o) => { o.updatedAt = Date.now(); return db.put(store, o); };
+
+/* ============================== Small DOM helpers ============================== */
+
+function h(tag, attrs = {}, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (k === 'class') el.className = v;
+    else if (k === 'html') el.innerHTML = v;
+    else if (k === 'style') el.style.cssText = v;
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat(Infinity)) {
+    if (kid == null || kid === false) continue;
+    el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  }
+  return el;
+}
+const md = (s) => DOMPurify.sanitize(marked.parse(s || ''));
+const mdEl = (s) => h('div', { class: 'md', html: md(s) });
+const $ = (sel) => document.querySelector(sel);
+const go = (hash) => { location.hash = hash; };
+
+function toast(msg, ms = 2600) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.remove('hidden');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.add('hidden'), ms);
+}
+
+function sheet(title, body, actions = []) {
+  return new Promise((resolve) => {
+    const root = $('#sheet-root');
+    const close = (v) => { root.innerHTML = ''; resolve(v); };
+    const bg = h('div', { class: 'sheet-bg', onclick: (e) => { if (e.target === bg) close(null); } },
+      h('div', { class: 'sheet' },
+        h('h2', {}, title),
+        body,
+        h('div', { class: 'row', style: 'margin-top:16px; justify-content:flex-end' },
+          h('button', { class: 'btn', onclick: () => close(null) }, 'Cancel'),
+          actions.map((a) => h('button', { class: 'btn ' + (a.cls || 'primary'), onclick: async () => { const v = await a.run(); if (v !== false) close(v ?? true); } }, a.label)))));
+    root.innerHTML = '';
+    root.append(bg);
+    bg.querySelector('input,textarea')?.focus();
+  });
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); toast('Copied'); }
+  catch { toast('Couldn’t copy — select and copy manually'); }
+}
+
+const busy = (btn, label = 'Working…') => {
+  const old = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spin"></span> ${label}`;
+  return () => { btn.disabled = false; btn.innerHTML = old; };
+};
+
+/* ============================== Claude API ============================== */
+
+class NeedKey extends Error {}
+
+function friendlyError(e) {
+  if (e instanceof NeedKey) return 'Add your Claude API key in Settings first.';
+  const s = e?.status;
+  if (s === 401) return 'Your Claude API key was rejected. Check it in Settings.';
+  if (s === 403) return 'Your API key doesn’t have permission for this (403).';
+  if (s === 429) return 'Rate limit hit — wait a minute and try again. (Or raise your limits in the Claude Console.)';
+  if (s === 529 || s === 503) return 'Claude is overloaded right now. Try again in a moment.';
+  if (s === 400 && /credit balance/i.test(e.message)) return 'Your Claude API account is out of credits. Add credits at console.anthropic.com → Billing.';
+  if (e?.name === 'APIConnectionError' || /fetch|network/i.test(e?.message || '')) return 'Network problem — check your connection and try again.';
+  return e?.message || String(e);
+}
+
+const upgradeTool = (t) => ({ ...t, type: t.type.replace('web_search_20250305', 'web_search_20260209').replace('web_fetch_20250910', 'web_fetch_20260209') });
+
+/**
+ * One call to Claude, streamed. Handles server-tool pauses, refusal fallback,
+ * and a couple of compatibility retries. Returns { text, content, message }.
+ */
+async function claude({ system, messages, tools, effort, maxTokens = 32000, format, onText }) {
+  const s = S.get();
+  if (!s.apiKey) throw new NeedKey();
+  const client = new Anthropic({ apiKey: s.apiKey, dangerouslyAllowBrowser: true, maxRetries: 2 });
+  const params = {
+    model: s.model,
+    max_tokens: maxTokens,
+    system,
+    messages: [...messages],
+    output_config: { effort: effort || s.effort, ...(format ? { format } : {}) },
+    ...(tools ? { tools } : {}),
+  };
+  // Server-side fallback: if a safety filter declines, the server reroutes the request.
+  let useFallbacks = !s.model.startsWith('claude-haiku');
+  let upgraded = false;
+  let text = '';
+  const content = [];
+  let final;
+  for (let turn = 0; turn < 8; turn++) {
+    const req = { ...params };
+    if (useFallbacks) { req.betas = ['server-side-fallback-2026-07-01']; req.fallbacks = 'default'; }
+    const before = text;
+    try {
+      const stream = client.beta.messages.stream(req);
+      stream.on('text', (t) => { text += t; onText?.(text); });
+      final = await stream.finalMessage();
+    } catch (e) {
+      text = before;
+      if (e?.status === 400 && useFallbacks && /fallback|beta/i.test(e.message)) { useFallbacks = false; turn--; continue; }
+      if (e?.status === 400 && params.tools && !upgraded && /web_(search|fetch)|tool/i.test(e.message)) {
+        upgraded = true; params.tools = params.tools.map(upgradeTool); turn--; continue;
+      }
+      throw e;
+    }
+    content.push(...final.content);
+    if (final.stop_reason === 'pause_turn') {
+      params.messages = [...params.messages, { role: 'assistant', content: final.content }];
+      continue;
+    }
+    break;
+  }
+  if (final?.stop_reason === 'refusal') {
+    throw new Error('Claude declined this request (a safety filter flagged it). Try rephrasing, or switch models in Settings.');
+  }
+  if (final?.stop_reason === 'max_tokens') text += '\n\n_(Answer was cut off because it hit the length limit.)_';
+  return { text, content, message: final };
+}
+
+/** Stream an answer into an element, rendering Markdown as it arrives. */
+async function streamInto(el, opts) {
+  el.innerHTML = '<div class="thinking"><span class="spin"></span> Reading and thinking… (long cases can take a minute)</div>';
+  let pending = null;
+  const paint = (t) => {
+    pending = t;
+    if (paint.raf) return;
+    paint.raf = requestAnimationFrame(() => { paint.raf = 0; el.innerHTML = md(pending); });
+  };
+  try {
+    const r = await claude({ ...opts, onText: paint });
+    cancelAnimationFrame(paint.raf); paint.raf = 0;
+    el.innerHTML = md(r.text);
+    return r;
+  } catch (e) {
+    cancelAnimationFrame(paint.raf); paint.raf = 0;
+    el.innerHTML = '';
+    el.append(h('div', { class: 'err' }, '⚠️ ' + friendlyError(e)));
+    if (e instanceof NeedKey) el.append(h('p', {}, h('a', { href: '#/settings' }, 'Open Settings →')));
+    throw e;
+  }
+}
+
+function lastJSON(text) {
+  const blocks = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)].map((m) => m[1]);
+  const candidates = blocks.length ? blocks.reverse() : [text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)];
+  for (const c of candidates) { try { return JSON.parse(c); } catch {} }
+  return null;
+}
+const stripJSONBlocks = (text) => text.replace(/```json[\s\S]*?```/g, '').trim();
+
+/* ---- Context builders (stable order so prompt caching kicks in) ---- */
+
+function systemFor(p, c) {
+  const blocks = [{ type: 'text', text: S.get().style + BASE_RULES }];
+  let ctx = `PROJECT: ${p.name}\nCOURT / JURISDICTION: ${p.court || 'not specified'}\nOUR SIDE: ${p.side || 'not specified'}`;
+  if (p.draft) ctx += `\n\nMY DRAFT BRIEF (context for everything we discuss):\n<brief>\n${p.draft}\n</brief>`;
+  blocks.push({ type: 'text', text: ctx, cache_control: { type: 'ephemeral' } });
+  if (c?.text) {
+    blocks.push({
+      type: 'text',
+      text: `THE CASE WE ARE READING: ${c.name}${c.citation ? ', ' + c.citation : ''}${c.court ? ' (' + c.court + (c.year ? ' ' + c.year : '') + ')' : ''}\n<opinion>\n${c.text}\n</opinion>`,
+      cache_control: { type: 'ephemeral' },
+    });
+  }
+  return blocks;
+}
+
+/* ============================== Reading files ============================== */
+
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    if (document.querySelector(`script[src="${src}"]`)) return res();
+    const s = document.createElement('script');
+    s.src = src; s.onload = res; s.onerror = () => rej(new Error('Could not load ' + src));
+    document.head.append(s);
+  });
+}
+
+async function pdfToText(buf) {
+  const pdfjs = await import('./vendor/pdf.min.mjs');
+  pdfjs.GlobalWorkerOptions.workerSrc = new URL('./vendor/pdf.worker.min.mjs', import.meta.url).href;
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
+  let out = '';
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const tc = await page.getTextContent();
+    let line = '';
+    for (const it of tc.items) {
+      line += it.str;
+      if (it.hasEOL) { out += line + '\n'; line = ''; }
+    }
+    out += line + '\n\n';
+  }
+  // Gentle reflow: rejoin lines broken mid-sentence by the PDF layout.
+  return out
+    .replace(/(\w)-\n(?=[a-z])/g, '$1')
+    .replace(/([^\n.:;?!"”)\]])\n(?=[a-z(“"])/g, '$1 ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+async function fileToText(file) {
+  const name = file.name.toLowerCase();
+  if (name.endsWith('.pdf') || file.type === 'application/pdf') {
+    const t = await pdfToText(await file.arrayBuffer());
+    if (t.replace(/\s/g, '').length < 200) throw new Error('This PDF seems to be a scanned image with no text layer. Try downloading it again as a text PDF (Westlaw’s normal PDF download works).');
+    return t;
+  }
+  if (name.endsWith('.docx')) {
+    await loadScript('vendor/mammoth.browser.min.js');
+    const r = await window.mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+    return r.value.replace(/\n{3,}/g, '\n\n').trim();
+  }
+  if (name.endsWith('.doc')) throw new Error('Old .doc files aren’t supported — save it as .docx or PDF first.');
+  return (await file.text()).trim();
+}
+
+function htmlToText(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  doc.querySelectorAll('br').forEach((b) => b.replaceWith('\n'));
+  doc.querySelectorAll('p,div,h1,h2,h3,h4,h5,h6,li,blockquote,tr,pre').forEach((el) => el.append('\n\n'));
+  return (doc.body.textContent || '').replace(/[ \t]+/g, ' ').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/* ============================== Finding case text ============================== */
+
+const CL = 'https://www.courtlistener.com';
+
+async function clFetch(path, opts = {}) {
+  const token = S.get().clToken;
+  const headers = { ...(opts.headers || {}) };
+  if (token) headers.Authorization = 'Token ' + token;
+  const r = await fetch(path.startsWith('http') ? path : CL + path, { ...opts, headers });
+  if (!r.ok) throw new Error('CourtListener HTTP ' + r.status);
+  return r.json();
+}
+
+/** Look up a citation in CourtListener. Returns the matching cluster or null. Needs a (free) token. */
+async function clLookupCitation(citation) {
+  if (!S.get().clToken) return null;
+  const arr = await clFetch('/api/rest/v4/citation-lookup/', { method: 'POST', body: new URLSearchParams({ text: citation }) });
+  const hit = (arr || []).find((x) => x.clusters?.length);
+  return hit ? hit.clusters[0] : null;
+}
+
+async function clOpinionText(opinionUrlOrId) {
+  const id = String(opinionUrlOrId).match(/(\d+)\/?$/)?.[1];
+  const o = await clFetch(`/api/rest/v4/opinions/${id}/`);
+  const html = o.html_with_citations || o.html || o.html_lawbox || o.html_columbia || o.xml_harvard || '';
+  const text = o.plain_text?.trim() ? o.plain_text : htmlToText(html);
+  return { text: text.trim(), type: o.type || '' };
+}
+
+async function pullFromCourtListener(c, status) {
+  let cluster = null;
+  if (c.citation) {
+    status('Checking CourtListener’s citation database…');
+    cluster = await clLookupCitation(c.citation);
+  }
+  if (!cluster) {
+    status('Searching CourtListener…');
+    const q = c.citation ? `"${c.citation}"` : `caseName:(${c.name})`;
+    const j = await clFetch('/api/rest/v4/search/?type=o&q=' + encodeURIComponent(q));
+    const r = j.results?.[0];
+    if (!r) return null;
+    cluster = { case_name: r.caseName, absolute_url: r.absolute_url, date_filed: r.dateFiled, court: r.court, citations: r.citation, sub_opinions: (r.opinions || []).map((o) => o.id) };
+  }
+  const ops = (cluster.sub_opinions || []).slice(0, 5);
+  if (!ops.length) return null;
+  status('Downloading the opinion from CourtListener…');
+  const parts = [];
+  for (const op of ops) {
+    const { text, type } = await clOpinionText(op);
+    if (text) parts.push((ops.length > 1 ? `===== ${opinionLabel(type)} =====\n\n` : '') + text);
+  }
+  const text = parts.join('\n\n');
+  if (text.length < 1500) return null;
+  return {
+    text,
+    source: 'CourtListener',
+    url: CL + (cluster.absolute_url || ''),
+    name: cluster.case_name || c.name,
+    year: (cluster.date_filed || '').slice(0, 4),
+    court: typeof cluster.court === 'string' ? cluster.court : '',
+    verified: true,
+  };
+}
+const opinionLabel = (t) => ({ '010combined': 'Opinion', '020lead': 'Lead opinion', '030concurrence': 'Concurrence', '040dissent': 'Dissent' }[t] || 'Opinion');
+
+/** Fallback: have Claude search the web and fetch the opinion. The raw page text comes back to us directly. */
+async function pullWithClaude(c, status) {
+  status('Asking Claude to find the opinion online… (this can take 30–90 seconds)');
+  const tools = [
+    { type: 'web_search_20250305', name: 'web_search', max_uses: 5 },
+    { type: 'web_fetch_20250910', name: 'web_fetch', max_uses: 6, max_content_tokens: 150000 },
+  ];
+  const prompt = `Find and fetch the FULL TEXT of this court opinion:
+Case: ${c.name || '(unknown name)'}
+Citation: ${c.citation || '(unknown)'}
+${c.url ? 'Start with this URL: ' + c.url : ''}
+
+Use web search to locate a free, full-text copy, then use web_fetch on that page. Good sources: courtlistener.com, law.justia.com, casetext.com, law.cornell.edu, caselaw.findlaw.com, leagle.com, casemine.com, govinfo.gov, and official court websites. If a page only has a summary or is blocked, try another source. Make sure it is the right case (name, court, and year match the citation).
+
+When finished, reply with ONLY a JSON object in a \`\`\`json block:
+{"found": true|false, "url": "URL of the full opinion you fetched", "case_name": "...", "citation": "...", "court": "...", "year": "...", "note": "anything I should know"}`;
+  const r = await claude({ system: 'You are a careful legal research assistant who retrieves court opinions.', messages: [{ role: 'user', content: prompt }], tools, effort: 'low', maxTokens: 8000 });
+  const info = lastJSON(r.text) || {};
+  // Collect every fetched document from the tool results.
+  const docs = [];
+  for (const b of r.content) {
+    if (b.type !== 'web_fetch_tool_result') continue;
+    const res = b.content;
+    if (!res || res.type !== 'web_fetch_result') continue;
+    const src = res.content?.source;
+    if (!src) continue;
+    let text = '';
+    if (src.type === 'text') text = src.data || '';
+    else if (src.type === 'base64' && /pdf/.test(src.media_type || '')) {
+      try { text = await pdfToText(Uint8Array.from(atob(src.data), (ch) => ch.charCodeAt(0)).buffer); } catch {}
+    }
+    if (text) docs.push({ url: res.url, text });
+  }
+  if (!docs.length) return { notFound: true, note: info.note || 'Claude couldn’t fetch a full-text copy.' };
+  const pick = docs.find((d) => info.url && d.url === info.url) || docs.sort((a, b) => b.text.length - a.text.length)[0];
+  if (info.found === false || pick.text.length < 1500) return { notFound: true, note: info.note || 'Only a partial or summary page was found.' };
+  return {
+    text: pick.text.trim(),
+    source: new URL(pick.url).hostname.replace(/^www\./, ''),
+    url: pick.url,
+    name: info.case_name || c.name,
+    citation: info.citation || c.citation,
+    court: info.court || c.court,
+    year: info.year || c.year,
+    note: info.note,
+  };
+}
+
+async function pullCase(c, status) {
+  let got = null;
+  try { got = await pullFromCourtListener(c, status); }
+  catch (e) { console.warn('CourtListener failed', e); }
+  if (!got) {
+    got = await pullWithClaude(c, status);
+    if (got.notFound) throw new Error('Couldn’t find a free full-text copy online. ' + (got.note || '') + '\n\nDownload it from Westlaw and upload the PDF instead.');
+  }
+  Object.assign(c, {
+    text: got.text, source: got.source, url: got.url,
+    name: got.name || c.name, citation: got.citation || c.citation,
+    court: got.court || c.court, year: got.year || c.year,
+    verified: !!got.verified, fetchNote: got.note || '',
+  });
+  return c;
+}
+
+/* ============================== Data shapes ============================== */
+
+function newCase(projectId, { name = '', citation = '', url = '' } = {}) {
+  return { id: uid(), projectId, name, citation, url, text: '', annotations: [], chat: [], support: {}, breakdown: '', createdAt: Date.now() };
+}
+const normCite = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const caseTitle = (c) => c.name || c.citation || 'Untitled case';
+
+async function findOrCreateCase(p, cit) {
+  const all = await projectCases(p.id);
+  const key = normCite(cit.citation);
+  let c = all.find((x) => (key && normCite(x.citation) === key) || (!key && x.name && x.name === cit.case_name));
+  if (!c) {
+    c = newCase(p.id, { name: cit.case_name, citation: cit.citation, url: cit.url || '' });
+    await save('cases', c);
+  }
+  return c;
+}
+
+const VERDICTS = {
+  strong: { label: '✅ Strong support', cls: 'ok' },
+  partial: { label: '🟡 Partial support', cls: 'warn' },
+  weak: { label: '⚠️ Weak / dicta only', cls: 'warn' },
+  none: { label: '❌ Doesn’t support', cls: 'bad' },
+  against: { label: '🚫 Cuts against us', cls: 'bad' },
+};
+const verdictBadge = (v) => (v && VERDICTS[v] ? h('span', { class: 'badge ' + VERDICTS[v].cls }, VERDICTS[v].label) : null);
+
+/* ============================== Router ============================== */
+
+const app = $('#app');
+async function route() {
+  hideSelbar();
+  $('#toast').classList.add('hidden');
+  const [path, query = ''] = location.hash.replace(/^#/, '').split('?');
+  const q = Object.fromEntries(new URLSearchParams(query));
+  const parts = path.split('/').filter(Boolean);
+  window.scrollTo(0, 0);
+  try {
+    if (parts[0] === 'settings') return viewSettings();
+    if (parts[0] === 'p' && parts[2] === 'prop') return await viewProp(parts[1], parts[3]);
+    if (parts[0] === 'p') return await viewProject(parts[1], q.tab || 'points');
+    if (parts[0] === 'c') return await viewCase(parts[1], q.tab || 'read', q.prop);
+    return await viewHome();
+  } catch (e) {
+    console.error(e);
+    app.innerHTML = '';
+    app.append(header('Something went wrong', '#/'), h('main', {}, h('div', { class: 'err' }, String(e?.message || e))));
+  }
+}
+window.addEventListener('hashchange', route);
+
+function header(title, back, sub, right) {
+  return h('header', { class: 'top' },
+    back ? h('button', { class: 'iconbtn', 'aria-label': 'Back', onclick: () => go(back) }, '‹') : null,
+    h('h1', {}, title, sub ? h('span', { class: 'sub' }, sub) : null),
+    right || null);
+}
+function tabs(items, active, hrefFor) {
+  return h('nav', { class: 'tabs' }, items.map(([k, label]) => h('button', { class: 'tab' + (k === active ? ' on' : ''), onclick: () => go(hrefFor(k)) }, label)));
+}
+
+/* ============================== Home ============================== */
+
+async function viewHome() {
+  const s = S.get();
+  const projects = (await db.all('projects')).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const cases = await db.all('cases');
+  const main = h('main', {});
+  if (!s.apiKey) {
+    main.append(h('div', { class: 'banner' },
+      h('strong', {}, 'One-time setup: '), 'add your Claude API key so the app can explain cases. ',
+      h('a', { href: '#/settings' }, 'Open Settings →')));
+  }
+  main.append(
+    h('div', { class: 'stack' },
+      h('button', { class: 'btn primary big', onclick: newProjectSheet }, '＋ New brief or motion'),
+      h('button', { class: 'btn big', onclick: quickCase }, '📄 Just explain one case')),
+    h('div', { class: 'section-title' }, 'Your projects'));
+  if (!projects.length) main.append(h('p', { class: 'muted' }, 'No projects yet. Start one by uploading your draft motion — or just explain a single case.'));
+  for (const p of projects) {
+    const n = cases.filter((c) => c.projectId === p.id).length;
+    main.append(h('div', { class: 'card tap', onclick: () => go('#/p/' + p.id) },
+      h('h3', {}, p.name),
+      h('div', { class: 'small muted' }, [p.court, `${(p.props || []).length} points`, `${n} cases`].filter(Boolean).join(' · '))));
+  }
+  app.replaceChildren(header('Case Review', null, null, h('button', { class: 'iconbtn', 'aria-label': 'Settings', onclick: () => go('#/settings') }, '⚙︎')), main);
+}
+
+function draftPicker() {
+  const state = { text: '', fileName: '' };
+  const status = h('div', { class: 'small muted' });
+  const paste = h('textarea', { placeholder: 'Or paste your draft here…' });
+  paste.addEventListener('input', () => { state.text = paste.value; state.fileName = ''; });
+  const input = h('input', { type: 'file', accept: '.pdf,.docx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain' });
+  input.addEventListener('change', async () => {
+    const f = input.files[0];
+    if (!f) return;
+    status.textContent = 'Reading ' + f.name + '…';
+    try {
+      state.text = await fileToText(f);
+      state.fileName = f.name;
+      paste.value = state.text;
+      status.textContent = `✓ Loaded ${f.name} (${state.text.length.toLocaleString()} characters)`;
+    } catch (e) { status.textContent = '⚠️ ' + e.message; }
+  });
+  const el = h('div', {}, h('label', { class: 'file' }, input, '📎 Upload draft (Word .docx, PDF, or text)'), status, h('label', { class: 'f' }, 'Paste instead'), paste);
+  return { el, state };
+}
+
+async function newProjectSheet() {
+  const name = h('input', { type: 'text', placeholder: 'e.g., Smith v. Acme — MTD' });
+  const court = h('input', { type: 'text', placeholder: 'e.g., S.D.N.Y. (2d Cir.) — or leave blank to detect' });
+  const side = h('input', { type: 'text', value: 'Defendant, moving to dismiss' });
+  const dp = draftPicker();
+  const body = h('div', {},
+    h('label', { class: 'f' }, 'Project name'), name,
+    h('label', { class: 'f' }, 'Court / jurisdiction (helps find binding cases)'), court,
+    h('label', { class: 'f' }, 'Our side'), side,
+    h('label', { class: 'f' }, 'Your draft (with case cites and [brackets] for research you still need)'), dp.el);
+  const p = await sheet('New brief or motion', body, [{
+    label: 'Create', run: async () => {
+      const proj = {
+        id: uid(), name: name.value.trim() || dp.state.fileName || 'Untitled brief', court: court.value.trim(), side: side.value.trim(),
+        draft: dp.state.text.trim(), draftName: dp.state.fileName, props: [], createdAt: Date.now(),
+      };
+      await save('projects', proj);
+      return proj;
+    },
+  }]);
+  if (p) { go(`#/p/${p.id}?tab=points`); if (p.draft) setTimeout(() => analyzeDraft(p.id), 50); }
+}
+
+async function quickCase() {
+  let p = (await db.all('projects')).find((x) => x.quick);
+  if (!p) {
+    p = { id: uid(), name: 'Quick cases', quick: true, court: '', side: '', draft: '', props: [], createdAt: Date.now() };
+    await save('projects', p);
+  }
+  const c = await addCaseSheet(p);
+  if (c) go('#/c/' + c.id + (c.text ? '' : '?pull=1'));
+}
+
+/* ============================== Settings ============================== */
+
+function viewSettings() {
+  const s = S.get();
+  const key = h('input', { type: 'password', value: s.apiKey, placeholder: 'sk-ant-…', autocomplete: 'off' });
+  const cl = h('input', { type: 'password', value: s.clToken, placeholder: 'optional', autocomplete: 'off' });
+  const model = h('select', {}, MODELS.map((m) => h('option', { value: m.id, selected: m.id === s.model }, m.label)));
+  const effort = h('select', {}, [['low', 'Quick'], ['medium', 'Balanced (default)'], ['high', 'Thorough (slower, costs more)']].map(([v, l]) => h('option', { value: v, selected: v === s.effort }, l)));
+  const style = h('textarea', { style: 'min-height:260px' }, s.style);
+  const doSave = () => {
+    S.set({ apiKey: key.value.trim(), clToken: cl.value.trim(), model: model.value, effort: effort.value, style: style.value.trim() || DEFAULT_STYLE });
+    toast('Saved');
+  };
+  const main = h('main', {},
+    h('div', { class: 'card' },
+      h('h3', {}, 'Claude API key (required)'),
+      h('p', { class: 'small muted' }, 'This is what lets the app read and explain cases. Get one at ', h('a', { href: 'https://console.anthropic.com/settings/keys', target: '_blank', rel: 'noopener' }, 'console.anthropic.com'), ' → API Keys, and add a few dollars of credit under Billing. The key is saved only on this phone.'),
+      key,
+      h('div', { class: 'row', style: 'margin-top:8px' }, h('button', { class: 'btn slim', onclick: testKey }, 'Test key'))),
+    h('div', { class: 'card' },
+      h('h3', {}, 'CourtListener token (optional, free)'),
+      h('p', { class: 'small muted' }, 'CourtListener is a free public case law library. A token makes pulling cases faster and lets the app double-check that citations are real. Sign up at ', h('a', { href: 'https://www.courtlistener.com/sign-in/', target: '_blank', rel: 'noopener' }, 'courtlistener.com'), ', then copy your token from Profile → Developer Tools → API.'),
+      cl),
+    h('div', { class: 'card' },
+      h('h3', {}, 'Model & depth'),
+      h('label', { class: 'f' }, 'Model'), model,
+      h('label', { class: 'f' }, 'How hard Claude thinks'), effort),
+    h('div', { class: 'card' },
+      h('h3', {}, 'How to explain things to me'),
+      h('p', { class: 'small muted' }, 'These are the built-in instructions used for every explanation. Edit them any time.'),
+      style,
+      h('div', { class: 'row', style: 'margin-top:8px' }, h('button', { class: 'btn slim', onclick: () => { style.value = DEFAULT_STYLE; } }, 'Reset to default'))),
+    h('button', { class: 'btn primary big', onclick: doSave }, 'Save settings'),
+    h('div', { class: 'section-title' }, 'Backup'),
+    h('div', { class: 'card stack' },
+      h('p', { class: 'small muted', style: 'margin:0' }, 'Your projects live only on this device. Export a backup now and then (and to move to another device).'),
+      h('div', { class: 'btns' },
+        h('button', { class: 'btn', onclick: exportBackup }, '⬇︎ Export backup'),
+        h('label', { class: 'btn' }, '⬆︎ Import backup', h('input', { type: 'file', accept: '.json,application/json', style: 'display:none', onchange: importBackup })))),
+    h('p', { class: 'small muted' }, 'Privacy: when you ask for an explanation, your draft and the case text are sent to Anthropic’s API to generate the answer. Anthropic does not train on API data by default. Check your firm’s policy before uploading client-confidential drafts.'));
+  app.replaceChildren(header('Settings', '#/'), main);
+
+  async function testKey(e) {
+    doSave();
+    const done = busy(e.currentTarget, 'Testing…');
+    try {
+      await claude({ system: 'Reply with exactly: OK', messages: [{ role: 'user', content: 'Test' }], effort: 'low', maxTokens: 2000 });
+      toast('✓ Key works');
+    } catch (err) { toast('⚠️ ' + friendlyError(err), 5000); }
+    done();
+  }
+}
+
+async function exportBackup() {
+  const data = { version: 1, exportedAt: new Date().toISOString(), projects: await db.all('projects'), cases: await db.all('cases') };
+  const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+  const a = h('a', { href: URL.createObjectURL(blob), download: `case-review-backup-${new Date().toISOString().slice(0, 10)}.json` });
+  document.body.append(a); a.click(); a.remove();
+}
+async function importBackup(e) {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    const data = JSON.parse(await f.text());
+    for (const p of data.projects || []) await db.put('projects', p);
+    for (const c of data.cases || []) await db.put('cases', c);
+    toast(`Imported ${(data.projects || []).length} projects`);
+  } catch (err) { toast('⚠️ Not a valid backup file'); }
+}
+
+/* ============================== Project ============================== */
+
+async function viewProject(pid, tab) {
+  const p = await db.get('projects', pid);
+  if (!p) return go('#/');
+  if (p.analyzing && Date.now() - (p.updatedAt || 0) > 5 * 60 * 1000) { p.analyzing = false; p.analyzeError = 'The last analysis didn’t finish (the app may have been closed). Try again.'; await save('projects', p); }
+  const cases = await projectCases(pid);
+  const menu = h('button', { class: 'iconbtn', 'aria-label': 'Project menu', onclick: () => projectMenu(p) }, '⋯');
+  const items = p.quick ? [['cases', 'Cases']] : [['points', 'Points'], ['cases', `Cases (${cases.length})`], ['draft', 'Paragraphs'], ['brief', 'My draft']];
+  if (p.quick) tab = 'cases';
+  const main = h('main', {});
+  app.replaceChildren(header(p.name, '#/', p.court || null, menu), tabs(items, tab, (k) => `#/p/${pid}?tab=${k}`), main);
+
+  if (tab === 'points') {
+    const props = p.props || [];
+    if (p.analyzing) {
+      main.append(h('div', { class: 'card' }, h('div', { class: 'thinking' }, h('span', { class: 'spin' }), 'Reading your draft and splitting it into points… (about a minute)')));
+      return;
+    }
+    if (!props.length) {
+      main.append(h('div', { class: 'card stack' },
+        h('h3', {}, p.draft ? 'Ready to go through your draft' : 'Add your draft'),
+        h('p', { class: 'muted', style: 'margin:0' }, p.draft
+          ? 'I’ll go through it point by point: each legal proposition, the cases you cited for it, and every [bracket] where you still need authority.'
+          : 'Upload your draft motion (with citations and [brackets]) under “My draft”, or add points by hand.'),
+        p.draft ? h('button', { class: 'btn primary big', onclick: () => analyzeDraft(p.id) }, '🧭 Go through my draft') : h('button', { class: 'btn primary big', onclick: () => go(`#/p/${pid}?tab=brief`) }, 'Add my draft'),
+        h('button', { class: 'btn big', onclick: () => addPropSheet(p) }, '＋ Add a point by hand')));
+      if (p.analyzeError) main.append(h('div', { class: 'err' }, '⚠️ ' + p.analyzeError));
+      return;
+    }
+    const research = props.filter((x) => x.kind === 'research_needed').length;
+    main.append(h('p', { class: 'small muted' }, `${props.length} points · ${research} need research. Tap a point to work on it.`));
+    let lastSection = null;
+    for (const prop of props) {
+      if (prop.section !== lastSection) { main.append(h('div', { class: 'section-title' }, prop.section || 'General')); lastSection = prop.section; }
+      const linked = (prop.caseIds || []).map((id) => cases.find((c) => c.id === id)).filter(Boolean);
+      main.append(h('div', { class: 'card tap', onclick: () => go(`#/p/${pid}/prop/${prop.id}`) },
+        h('div', { class: 'row', style: 'margin-bottom:4px' },
+          prop.kind === 'research_needed' ? h('span', { class: 'badge research' }, '🔎 Needs research') : null,
+          prop.paragraph ? h('span', { class: 'badge ok' }, '✍️ Paragraph drafted') : null),
+        h('div', {}, prop.text),
+        prop.bracket ? h('div', { class: 'small note' }, prop.bracket) : null,
+        linked.length ? h('div', { style: 'margin-top:6px' }, linked.map((c) => h('span', { class: 'chip' + (c.text ? ' pulled' : '') }, c.support?.[prop.id]?.verdict ? VERDICTS[c.support[prop.id].verdict]?.label.split(' ')[0] : (c.text ? '📖' : '·'), ' ', caseTitle(c)))) : null));
+    }
+    main.append(h('button', { class: 'btn big', onclick: () => addPropSheet(p) }, '＋ Add a point'));
+  }
+
+  if (tab === 'cases') {
+    main.append(h('button', { class: 'btn primary big', onclick: async () => { const c = await addCaseSheet(p); if (c) go('#/c/' + c.id + (c.text ? '' : '?pull=1')); } }, '＋ Add a case'));
+    if (!cases.length) main.append(h('p', { class: 'muted' }, p.quick ? 'Add a case by citation, or upload a PDF from Westlaw, and I’ll break it down for you.' : 'Cases from your draft show up here once you open them from a point.'));
+    for (const c of cases.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))) {
+      const verdicts = Object.values(c.support || {}).map((s) => s.verdict).filter(Boolean);
+      main.append(h('div', { class: 'card tap', onclick: () => go('#/c/' + c.id) },
+        h('h3', {}, caseTitle(c)),
+        h('div', { class: 'small muted' }, [c.citation, c.text ? '📖 ready to read' : 'not pulled yet', c.annotations?.length ? `${c.annotations.length} notes` : null].filter(Boolean).join(' · ')),
+        verdicts.length ? h('div', { class: 'row', style: 'margin-top:6px' }, verdicts.map(verdictBadge)) : null));
+    }
+  }
+
+  if (tab === 'draft') {
+    const paras = (p.props || []).filter((x) => x.paragraph);
+    if (!paras.length) {
+      main.append(h('p', { class: 'muted' }, 'Paragraphs you build from your points collect here, in brief order. Open a point and tap “Write the paragraph”.'));
+      return;
+    }
+    const all = paras.map((x) => x.paragraph).join('\n\n');
+    main.append(h('button', { class: 'btn primary big', onclick: () => copyText(all) }, '📋 Copy all paragraphs'));
+    for (const prop of paras) {
+      main.append(h('div', { class: 'card' },
+        h('div', { class: 'small muted' }, prop.section),
+        h('div', { class: 'pre', style: 'margin:8px 0' }, prop.paragraph),
+        h('div', { class: 'row' },
+          h('button', { class: 'btn slim', onclick: () => copyText(prop.paragraph) }, 'Copy'),
+          h('button', { class: 'btn slim', onclick: () => go(`#/p/${pid}/prop/${prop.id}`) }, 'Open point'))));
+    }
+  }
+
+  if (tab === 'brief') {
+    main.append(h('div', { class: 'row', style: 'margin-bottom:12px' },
+      h('button', { class: 'btn', onclick: () => replaceDraft(p) }, p.draft ? '↻ Replace draft' : '📎 Add draft'),
+      p.draft ? h('button', { class: 'btn', onclick: () => analyzeDraft(p.id, true) }, '🧭 Re-analyze') : null));
+    main.append(p.draft ? h('div', { class: 'card pre' }, p.draft) : h('p', { class: 'muted' }, 'No draft yet.'));
+  }
+}
+
+async function projectMenu(p) {
+  const name = h('input', { type: 'text', value: p.name });
+  const court = h('input', { type: 'text', value: p.court || '' });
+  const side = h('input', { type: 'text', value: p.side || '' });
+  const del = h('button', { class: 'btn danger', style: 'margin-top:16px', onclick: async () => {
+    if (!confirm(`Delete “${p.name}” and all its cases and notes? This can’t be undone.`)) return;
+    for (const c of await projectCases(p.id)) await db.del('cases', c.id);
+    await db.del('projects', p.id);
+    $('#sheet-root').innerHTML = '';
+    go('#/');
+  } }, '🗑 Delete project');
+  const ok = await sheet('Project details', h('div', {},
+    h('label', { class: 'f' }, 'Name'), name,
+    h('label', { class: 'f' }, 'Court / jurisdiction'), court,
+    h('label', { class: 'f' }, 'Our side'), side, del), [{ label: 'Save', run: () => true }]);
+  if (ok) {
+    Object.assign(p, { name: name.value.trim() || p.name, court: court.value.trim(), side: side.value.trim() });
+    await save('projects', p);
+    route();
+  }
+}
+
+async function replaceDraft(p) {
+  const dp = draftPicker();
+  const ok = await sheet('Your draft', dp.el, [{ label: 'Use this draft', run: () => !!dp.state.text.trim() || (toast('Add a file or paste text'), false) }]);
+  if (!ok) return;
+  p.draft = dp.state.text.trim();
+  p.draftName = dp.state.fileName;
+  await save('projects', p);
+  if (!(p.props || []).length || confirm('Go through the new draft and rebuild the list of points? (Cases and notes you’ve pulled are kept.)')) analyzeDraft(p.id, true);
+  else route();
+}
+
+const PROPS_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['title', 'court', 'propositions'],
+  properties: {
+    title: { type: 'string', description: 'Short name for this brief, e.g. "Smith v. Acme — Motion to Dismiss"' },
+    court: { type: 'string', description: 'Court/jurisdiction from the caption, or empty string' },
+    propositions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['section', 'text', 'kind', 'bracket', 'citations'],
+        properties: {
+          section: { type: 'string', description: 'The brief heading this falls under' },
+          text: { type: 'string', description: 'The legal proposition, stated in one or two plain sentences' },
+          kind: { type: 'string', enum: ['cited', 'research_needed'] },
+          bracket: { type: 'string', description: 'Exact text of any bracketed research note, or empty string' },
+          citations: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['case_name', 'citation', 'pincite'],
+              properties: { case_name: { type: 'string' }, citation: { type: 'string' }, pincite: { type: 'string' } },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
+async function analyzeDraft(pid, rebuild = false) {
+  const p = await db.get('projects', pid);
+  if (!p?.draft) return;
+  p.analyzing = true; p.analyzeError = '';
+  await save('projects', p);
+  if (location.hash.startsWith('#/p/' + pid)) route();
+  try {
+    const r = await claude({
+      system: 'You are a meticulous litigation associate who maps briefs into their legal building blocks.',
+      messages: [{ role: 'user', content: `Here is my draft brief/motion. Go through it in order and break it into PROPOSITIONS: each distinct legal point that is (or should be) supported by case law.
+
+For each proposition:
+- section: the heading it falls under in the brief.
+- text: the proposition in one or two plain sentences, faithful to what I wrote.
+- kind: "cited" if I cite case law for it; "research_needed" if it has a bracket or placeholder asking for research (e.g. [find a case that says…], [cite], [confirm cite], [add support], TK, ??), or it is a legal assertion with no authority at all.
+- bracket: the exact bracketed note, if any (else "").
+- citations: every CASE cited for that point (case name, the full citation as written, pincite if given). Use "Id."/short cites resolved to the full case. Skip statutes and rules here.
+
+Keep the brief's order. Don't merge different points; don't split one point into many.
+
+<brief>
+${p.draft}
+</brief>` }],
+      format: { type: 'json_schema', schema: PROPS_SCHEMA },
+      maxTokens: 64000,
+    });
+    const data = JSON.parse(r.text);
+    const fresh = await db.get('projects', pid);
+    const old = rebuild ? [] : (fresh.props || []);
+    const props = data.propositions.map((x) => ({ id: uid(), section: x.section, text: x.text, kind: x.kind, bracket: x.bracket, citations: x.citations, caseIds: [] }));
+    // Link (and create placeholders for) the cases cited for each point.
+    for (const prop of props) {
+      for (const cit of prop.citations) {
+        if (!cit.citation && !cit.case_name) continue;
+        const c = await findOrCreateCase(fresh, cit);
+        if (!prop.caseIds.includes(c.id)) prop.caseIds.push(c.id);
+      }
+    }
+    fresh.props = [...old, ...props];
+    if (!fresh.court && data.court) fresh.court = data.court;
+    if ((!fresh.name || fresh.name === fresh.draftName || fresh.name === 'Untitled brief') && data.title) fresh.name = data.title;
+    fresh.analyzing = false;
+    await save('projects', fresh);
+    toast(`Found ${props.length} points`);
+  } catch (e) {
+    const fresh = await db.get('projects', pid);
+    fresh.analyzing = false; fresh.analyzeError = friendlyError(e);
+    await save('projects', fresh);
+  }
+  if (location.hash.startsWith('#/p/' + pid)) route();
+}
+
+async function addPropSheet(p) {
+  const section = h('input', { type: 'text', placeholder: 'e.g., I. Plaintiff fails to state a claim' });
+  const text = h('textarea', { placeholder: 'The legal point, e.g., “A complaint must plead facts, not just labels and conclusions.”' });
+  const cites = h('textarea', { placeholder: 'Cases you have for it, one per line (optional)\nBell Atl. Corp. v. Twombly, 550 U.S. 544 (2007)', style: 'min-height:80px' });
+  const ok = await sheet('Add a point', h('div', {}, h('label', { class: 'f' }, 'Section'), section, h('label', { class: 'f' }, 'Proposition'), text, h('label', { class: 'f' }, 'Cases'), cites),
+    [{ label: 'Add', run: () => !!text.value.trim() || (toast('Write the point first'), false) }]);
+  if (!ok) return;
+  const prop = { id: uid(), section: section.value.trim(), text: text.value.trim(), kind: 'research_needed', bracket: '', citations: [], caseIds: [] };
+  for (const line of cites.value.split('\n').map((l) => l.trim()).filter(Boolean)) {
+    const [name, ...rest] = line.split(/,\s*(?=\d)/);
+    const cit = { case_name: name.trim(), citation: rest.length ? line : '', pincite: '' };
+    const c = await findOrCreateCase(p, cit);
+    prop.caseIds.push(c.id);
+    prop.kind = 'cited';
+  }
+  p.props = [...(p.props || []), prop];
+  await save('projects', p);
+  go(`#/p/${p.id}/prop/${prop.id}`);
+}
+
+/* ============================== Add a case ============================== */
+
+async function addCaseSheet(p, propId) {
+  const cite = h('input', { type: 'text', placeholder: 'e.g., Ashcroft v. Iqbal, 556 U.S. 662 (2009)' });
+  const status = h('div', { class: 'small muted' });
+  const state = { text: '', fileName: '' };
+  const input = h('input', { type: 'file', accept: '.pdf,.docx,.txt,application/pdf' });
+  input.addEventListener('change', async () => {
+    const f = input.files[0];
+    if (!f) return;
+    status.textContent = 'Reading ' + f.name + '…';
+    try { state.text = await fileToText(f); state.fileName = f.name; status.textContent = `✓ ${f.name} loaded`; }
+    catch (e) { status.textContent = '⚠️ ' + e.message; }
+  });
+  const body = h('div', {},
+    h('label', { class: 'f' }, 'Case name and/or citation'), cite,
+    h('p', { class: 'small muted' }, 'I’ll try to pull the full opinion from free sources. Or upload it:'),
+    h('label', { class: 'file' }, input, '📎 Upload the case (Westlaw PDF, Word, or text)'), status);
+  return sheet('Add a case', body, [{
+    label: 'Add case', run: async () => {
+      const raw = cite.value.trim();
+      if (!raw && !state.text) { toast('Enter a citation or upload a file'); return false; }
+      const [name, ...rest] = raw.split(/,\s*(?=\d)/);
+      const c = newCase(p.id, { name: (name || state.fileName.replace(/\.\w+$/, '')).trim(), citation: rest.length ? raw : (/\d/.test(raw) ? raw : '') });
+      if (state.text) { c.text = state.text; c.source = 'Uploaded: ' + state.fileName; }
+      await save('cases', c);
+      if (propId) {
+        const fresh = await db.get('projects', p.id);
+        const prop = fresh.props.find((x) => x.id === propId);
+        if (prop && !prop.caseIds.includes(c.id)) prop.caseIds.push(c.id);
+        await save('projects', fresh);
+      }
+      if (state.text && !c.citation) identifyCase(c.id);
+      return c;
+    },
+  }]);
+}
+
+/** For uploaded cases without a citation, ask Claude to read the caption. */
+async function identifyCase(cid) {
+  try {
+    const c = await db.get('cases', cid);
+    const r = await claude({
+      system: 'Extract case metadata from the start of a court opinion.',
+      messages: [{ role: 'user', content: `From this opinion text, give the case name (Bluebook short form, e.g. "Smith v. Jones"), the reporter citation if shown, the court, and year.\n\n${c.text.slice(0, 12000)}` }],
+      format: { type: 'json_schema', schema: { type: 'object', additionalProperties: false, required: ['case_name', 'citation', 'court', 'year'], properties: { case_name: { type: 'string' }, citation: { type: 'string' }, court: { type: 'string' }, year: { type: 'string' } } } },
+      effort: 'low', maxTokens: 4000,
+    });
+    const m = JSON.parse(r.text);
+    const fresh = await db.get('cases', cid);
+    Object.assign(fresh, { name: m.case_name || fresh.name, citation: m.citation || fresh.citation, court: m.court || fresh.court, year: m.year || fresh.year });
+    await save('cases', fresh);
+    if (location.hash.includes(cid)) route();
+  } catch (e) { console.warn(e); }
+}
+
+/* ============================== Proposition (point) view ============================== */
+
+async function viewProp(pid, propId) {
+  const p = await db.get('projects', pid);
+  const prop = p?.props?.find((x) => x.id === propId);
+  if (!prop) return go('#/p/' + pid);
+  const cases = (await projectCases(pid));
+  const linked = (prop.caseIds || []).map((id) => cases.find((c) => c.id === id)).filter(Boolean);
+  const main = h('main', {});
+  app.replaceChildren(header('Point', `#/p/${pid}?tab=points`, prop.section), main);
+
+  main.append(h('div', { class: 'card' },
+    prop.kind === 'research_needed' ? h('span', { class: 'badge research' }, '🔎 Needs research') : null,
+    h('p', { style: 'margin:6px 0; font-size:17px' }, prop.text),
+    prop.bracket ? h('p', { class: 'note', style: 'margin:4px 0' }, prop.bracket) : null,
+    h('div', { class: 'row' },
+      h('button', { class: 'btn slim', onclick: editProp }, '✎ Edit'),
+      h('button', { class: 'btn slim danger', onclick: deleteProp }, 'Remove'))));
+
+  main.append(h('div', { class: 'section-title' }, `Cases for this point (${linked.length})`));
+  for (const c of linked) {
+    const sup = c.support?.[prop.id];
+    const pin = prop.citations?.find((x) => normCite(x.citation) === normCite(c.citation))?.pincite;
+    main.append(h('div', { class: 'card tap', onclick: () => go(`#/c/${c.id}?prop=${prop.id}&tab=${c.text ? (sup ? 'read' : 'support') : 'read'}`) },
+      h('h3', {}, caseTitle(c)),
+      h('div', { class: 'small muted' }, [c.citation, pin ? 'pin ' + pin : null, c.text ? '📖 ready' : 'tap to pull the case'].filter(Boolean).join(' · ')),
+      h('div', { class: 'row', style: 'margin-top:6px' }, sup ? verdictBadge(sup.verdict) : (c.text ? h('span', { class: 'badge' }, 'Support not checked yet') : null))));
+  }
+  main.append(h('div', { class: 'btns' },
+    h('button', { class: 'btn', onclick: async () => { const c = await addCaseSheet(p, prop.id); if (c) go(`#/c/${c.id}?prop=${prop.id}${c.text ? '' : '&pull=1'}`); } }, '＋ Add a case'),
+    h('button', { class: 'btn', onclick: (e) => checkAll(e.currentTarget) }, '⚖️ Check all cases')));
+
+  // Research
+  main.append(h('div', { class: 'section-title' }, 'Find more support'));
+  const resOut = h('div', { class: 'md' });
+  const resCands = h('div', {});
+  const resCard = h('div', { class: 'card' },
+    h('p', { class: 'small muted', style: 'margin-top:0' }, prop.kind === 'research_needed' ? 'Your draft flags this point for research. I’ll search the web for cases in your jurisdiction that support it.' : 'Want stronger or binding authority? I’ll search for more cases that support this point.'),
+    h('button', { class: 'btn primary big', onclick: (e) => research(e.currentTarget) }, prop.research ? '🔎 Search again' : '🔎 Find cases that support this'),
+    resOut, resCands);
+  main.append(resCard);
+  if (prop.research) showResearch(prop.research);
+
+  // Compare & paragraph
+  main.append(h('div', { class: 'section-title' }, 'Put it together'));
+  const synOut = h('div', { class: 'md' });
+  main.append(h('div', { class: 'card' },
+    h('button', { class: 'btn big', onclick: (e) => synthesize(e.currentTarget) }, prop.synthesis ? '🧩 Redo comparison' : '🧩 Compare the cases & how they fit together'),
+    synOut));
+  if (prop.synthesis) synOut.innerHTML = md(prop.synthesis);
+
+  const paraOut = h('div', {});
+  main.append(h('div', { class: 'card' },
+    h('button', { class: 'btn primary big', onclick: (e) => writeParagraph(e.currentTarget) }, prop.paragraph ? '✍️ Rewrite the paragraph' : '✍️ Write the paragraph for my motion'),
+    paraOut));
+  if (prop.paragraph) showParagraph(prop.paragraph, prop.paragraphNotes);
+
+  async function persist(mut) {
+    const fresh = await db.get('projects', pid);
+    const fp = fresh.props.find((x) => x.id === propId);
+    mut(fp);
+    await save('projects', fresh);
+    return fp;
+  }
+  async function editProp() {
+    const t = h('textarea', {}, prop.text);
+    const ok = await sheet('Edit point', t, [{ label: 'Save', run: () => true }]);
+    if (ok) { await persist((fp) => { fp.text = t.value.trim() || fp.text; }); route(); }
+  }
+  async function deleteProp() {
+    if (!confirm('Remove this point? (Its cases stay in the Cases tab.)')) return;
+    const fresh = await db.get('projects', pid);
+    fresh.props = fresh.props.filter((x) => x.id !== propId);
+    await save('projects', fresh);
+    go(`#/p/${pid}?tab=points`);
+  }
+
+  async function checkAll(btn) {
+    const todo = linked.filter((c) => !c.support?.[prop.id]);
+    if (!todo.length) return toast('All cases here are already checked');
+    const done = busy(btn, 'Checking…');
+    for (const [i, c] of todo.entries()) {
+      btn.innerHTML = `<span class="spin"></span> ${i + 1} of ${todo.length}: ${caseTitle(c).slice(0, 30)}`;
+      try {
+        if (!c.text) { await pullCase(c, () => {}); await save('cases', c); }
+        await runSupportCheck(p, c, prop, h('div'));
+      } catch (e) { toast(`⚠️ ${caseTitle(c)}: ${friendlyError(e)}`, 5000); }
+    }
+    done();
+    route();
+  }
+
+  async function research(btn) {
+    const done = busy(btn, 'Searching… (1–2 minutes)');
+    resCands.innerHTML = '';
+    const have = linked.map((c) => `- ${caseTitle(c)} ${c.citation || ''}`).join('\n') || '(none yet)';
+    try {
+      const r = await streamInto(resOut, {
+        system: systemFor(p),
+        messages: [{ role: 'user', content: `Find case law that supports this point in my brief.
+
+POINT: ${prop.text}
+${prop.bracket ? 'MY RESEARCH NOTE: ' + prop.bracket : ''}
+SECTION: ${prop.section || ''}
+JURISDICTION: ${p.court || 'not specified — infer from my brief'}
+CASES I ALREADY HAVE:
+${have}
+
+Use web search. Prioritize binding authority (the controlling appellate court and the highest court for my jurisdiction), then persuasive authority from the same district/circuit, then others. Prefer recent, frequently-cited cases. Only suggest cases you actually saw in search results or fetched pages — never from memory alone — and include the URL where you found each.
+
+Write for me in plain English:
+1. A short overview of what you found and how strong the support is.
+2. For each case: what it held, in one or two sentences, and exactly how it supports my point (step by step), plus any quote you saw word-for-word.
+3. Anything that cuts against my point.
+
+Then end with a \`\`\`json block: {"cases":[{"case_name":"","citation":"full reporter citation","court":"","year":"","url":"","why":"one sentence","strength":"strong|moderate|weak"}]}` }],
+        tools: [
+          { type: 'web_search_20250305', name: 'web_search', max_uses: 8 },
+          { type: 'web_fetch_20250910', name: 'web_fetch', max_uses: 4, max_content_tokens: 60000 },
+        ],
+        maxTokens: 32000,
+      });
+      const json = lastJSON(r.text);
+      const out = { text: stripJSONBlocks(r.text), cases: json?.cases || [], at: Date.now() };
+      await persist((fp) => { fp.research = out; });
+      prop.research = out;
+      showResearch(out);
+      verifyCandidates(out);
+    } catch (e) { /* shown inline */ }
+    done();
+  }
+
+  function showResearch(out) {
+    resOut.innerHTML = md(out.text);
+    resCands.innerHTML = '';
+    if (!out.cases?.length) return;
+    resCands.append(h('div', { class: 'section-title' }, 'Suggested cases'),
+      h('p', { class: 'small muted' }, 'AI-suggested from web search. Always pull and read the case — and confirm it on Westlaw (KeyCite) before citing.'));
+    for (const cand of out.cases) {
+      const already = cases.find((c) => cand.citation && normCite(c.citation) === normCite(cand.citation));
+      resCands.append(h('div', { class: 'card', style: 'background:var(--soft)' },
+        h('h3', {}, cand.case_name),
+        h('div', { class: 'small muted' }, [cand.citation, cand.court, cand.year].filter(Boolean).join(' · ')),
+        h('div', { class: 'row', style: 'margin:6px 0' },
+          cand.strength ? h('span', { class: 'badge ' + (cand.strength === 'strong' ? 'ok' : 'warn') }, cand.strength) : null,
+          cand.verified === true ? h('span', { class: 'badge ok' }, '✓ citation found on CourtListener') : cand.verified === false ? h('span', { class: 'badge bad' }, '⚠️ citation not found — double-check') : null),
+        h('p', { class: 'small', style: 'margin:4px 0' }, cand.why),
+        h('div', { class: 'row' },
+          already
+            ? h('button', { class: 'btn slim', onclick: () => go(`#/c/${already.id}?prop=${prop.id}`) }, 'Open')
+            : h('button', { class: 'btn slim primary', onclick: async () => {
+              const fresh = await db.get('projects', pid);
+              const c = await findOrCreateCase(fresh, { case_name: cand.case_name, citation: cand.citation, url: cand.url });
+              await persist((fp) => { if (!fp.caseIds.includes(c.id)) fp.caseIds.push(c.id); });
+              go(`#/c/${c.id}?prop=${prop.id}&pull=1`);
+            } }, '📖 Pull & read'),
+          cand.url ? h('a', { class: 'btn slim', href: cand.url, target: '_blank', rel: 'noopener' }, 'Source ↗') : null)));
+    }
+  }
+
+  async function verifyCandidates(out) {
+    if (!S.get().clToken) return;
+    let changed = false;
+    for (const cand of out.cases) {
+      if (!cand.citation || cand.verified !== undefined) continue;
+      try { cand.verified = !!(await clLookupCitation(cand.citation)); changed = true; } catch { /* CORS or rate limit — skip */ }
+    }
+    if (changed) { await persist((fp) => { fp.research = out; }); showResearch(out); }
+  }
+
+  async function synthesize(btn) {
+    const ready = linked.filter((c) => c.support?.[prop.id]);
+    if (!ready.length) return toast('Check at least one case against this point first (“Check all cases”).', 4000);
+    const done = busy(btn, 'Comparing…');
+    const analyses = ready.map((c) => `### ${caseTitle(c)} ${c.citation || ''}\n${c.support[prop.id].text}`).join('\n\n');
+    const notes = ready.map((c) => (c.annotations || []).filter((a) => a.note).map((a) => `- [${caseTitle(c)}] “${a.quote}” — my note: ${a.note}`).join('\n')).filter(Boolean).join('\n');
+    try {
+      const r = await streamInto(synOut, {
+        system: systemFor(p),
+        messages: [{ role: 'user', content: `Compare these cases and explain how they fit together to support my point.
+
+POINT: ${prop.text}
+
+YOUR EARLIER ANALYSIS OF EACH CASE:
+${analyses}
+${notes ? '\nMY HIGHLIGHT NOTES:\n' + notes : ''}
+
+Give me:
+## The big picture — do these cases, together, prove my point? How solidly?
+## How each case adds something (a short paragraph per case: the role it plays — e.g., sets out the rule, applies it to similar facts, binding authority)
+## How they connect — the logic chain from the rule to my facts (If… then… because…)
+## Weak spots and gaps — and what kind of case would fill them
+## Best order to cite them in` }],
+      });
+      await persist((fp) => { fp.synthesis = r.text; });
+    } catch {}
+    done();
+  }
+
+  function showParagraph(text, notes) {
+    paraOut.innerHTML = '';
+    paraOut.append(
+      h('div', { class: 'pre', style: 'margin:12px 0; padding:12px; background:var(--soft); border-radius:10px' }, text),
+      h('div', { class: 'row' }, h('button', { class: 'btn slim', onclick: () => copyText(text) }, '📋 Copy paragraph')),
+      notes ? h('details', { style: 'margin-top:10px' }, h('summary', {}, 'Why I wrote it this way & what to check'), mdEl(notes)) : null);
+  }
+
+  async function writeParagraph(btn) {
+    const ready = linked.filter((c) => c.support?.[prop.id] && !['none', 'against'].includes(c.support[prop.id].verdict));
+    if (!ready.length) return toast('Check your cases against this point first — I only write with cases you’ve reviewed.', 4500);
+    const done = busy(btn, 'Writing…');
+    const analyses = ready.map((c) => `### ${caseTitle(c)} — ${c.citation || '(citation unknown)'}\n${c.support[prop.id].text}`).join('\n\n');
+    const live = h('div', { class: 'md' });
+    paraOut.replaceChildren(live);
+    try {
+      const r = await streamInto(live, {
+        system: systemFor(p),
+        messages: [{ role: 'user', content: `Write the paragraph for my motion that makes this point.
+
+POINT: ${prop.text}
+SECTION: ${prop.section}
+${prop.synthesis ? 'YOUR COMPARISON OF THE CASES:\n' + prop.synthesis + '\n' : ''}
+CASES I'VE REVIEWED (use ONLY these):
+${analyses}
+
+Rules: persuasive, formal motion style that matches the voice of my draft. Bluebook citations with pincites where the opinion text shows them; otherwise put [pin]. Use explanatory parentheticals where helpful. Don't overstate what a case held.
+
+Output exactly two parts:
+<paragraph>
+(the paragraph only, plain text, no Markdown)
+</paragraph>
+<notes>
+## Why I wrote it this way (plain English, step by step)
+## Check before filing (pincites, KeyCite, anything I assumed)
+</notes>` }],
+      });
+      const para = (r.text.match(/<paragraph>([\s\S]*?)<\/paragraph>/)?.[1] || r.text).trim();
+      const notes = (r.text.match(/<notes>([\s\S]*?)<\/notes>/)?.[1] || '').trim();
+      await persist((fp) => { fp.paragraph = para; fp.paragraphNotes = notes; });
+      showParagraph(para, notes);
+    } catch {}
+    done();
+  }
+}
+
+/* ============================== Case view ============================== */
+
+const COLORS = [
+  { key: 'yellow', label: 'Important' },
+  { key: 'green', label: 'Helps us' },
+  { key: 'red', label: 'Hurts us' },
+  { key: 'blue', label: 'The rule' },
+];
+
+async function viewCase(cid, tab, propId) {
+  const c = await db.get('cases', cid);
+  if (!c) return go('#/');
+  const p = await db.get('projects', c.projectId);
+  const prop = p.props?.find((x) => x.id === propId);
+  const back = prop ? `#/p/${p.id}/prop/${prop.id}` : `#/p/${p.id}?tab=cases`;
+  const qs = (t) => `#/c/${cid}?tab=${t}${propId ? '&prop=' + propId : ''}`;
+  const menu = h('button', { class: 'iconbtn', 'aria-label': 'Case menu', onclick: () => caseMenu(c) }, '⋯');
+  const main = h('main', {});
+  const items = [['read', 'Read'], ['breakdown', 'Break it down'], ...(p.quick ? [] : [['support', 'Support?']]), ['chat', 'Ask'], ['notes', `Notes (${c.annotations?.length || 0})`]];
+  app.replaceChildren(header(caseTitle(c), back, [c.citation, c.court, c.year].filter(Boolean).join(' · ') || null, menu), tabs(items, tab, qs), main);
+
+  if (!c.text) return getCasePanel(main, c, p);
+
+  if (tab === 'read') return readTab(main, c, p, prop);
+  if (tab === 'breakdown') return breakdownTab(main, c, p);
+  if (tab === 'support') return supportTab(main, c, p, prop);
+  if (tab === 'chat') return chatTab(main, c, p, prop);
+  if (tab === 'notes') return notesTab(main, c, propId);
+}
+
+async function caseMenu(c) {
+  const name = h('input', { type: 'text', value: c.name || '' });
+  const cite = h('input', { type: 'text', value: c.citation || '' });
+  const del = h('button', { class: 'btn danger', style: 'margin-top:16px', onclick: async () => {
+    if (!confirm('Delete this case and its notes?')) return;
+    const p = await db.get('projects', c.projectId);
+    for (const prop of p.props || []) prop.caseIds = (prop.caseIds || []).filter((x) => x !== c.id);
+    await save('projects', p);
+    await db.del('cases', c.id);
+    $('#sheet-root').innerHTML = '';
+    go(`#/p/${p.id}?tab=cases`);
+  } }, '🗑 Delete case');
+  const replace = h('button', { class: 'btn', style: 'margin-top:16px; margin-right:8px', onclick: async () => {
+    if (c.annotations?.length && !confirm('Replacing the text removes your highlights on this case. Continue?')) return;
+    $('#sheet-root').innerHTML = '';
+    c.text = ''; c.annotations = []; c.breakdown = ''; await save('cases', c); route();
+  } }, '↻ Replace case text');
+  const ok = await sheet('Case details', h('div', {},
+    h('label', { class: 'f' }, 'Case name'), name, h('label', { class: 'f' }, 'Citation'), cite,
+    c.url ? h('p', { class: 'small' }, 'Source: ', h('a', { href: c.url, target: '_blank', rel: 'noopener' }, c.source || c.url)) : (c.source ? h('p', { class: 'small muted' }, 'Source: ' + c.source) : null),
+    h('div', {}, replace, del)), [{ label: 'Save', run: () => true }]);
+  if (ok) { c.name = name.value.trim(); c.citation = cite.value.trim(); await save('cases', c); route(); }
+}
+
+function getCasePanel(main, c, p) {
+  const status = h('div', { class: 'small muted', style: 'margin-top:8px; white-space:pre-wrap' });
+  const auto = h('button', { class: 'btn primary big', onclick: async () => {
+    const done = busy(auto, 'Finding the case…');
+    try {
+      await pullCase(c, (m) => { status.textContent = m; });
+      await save('cases', c);
+      toast('Got it');
+      route();
+    } catch (e) {
+      status.innerHTML = '';
+      status.append(h('span', { class: 'err' }, '⚠️ ' + friendlyError(e)));
+      done();
+    }
+  } }, '🔎 Find this case for me');
+  const input = h('input', { type: 'file', accept: '.pdf,.docx,.txt,application/pdf' });
+  input.addEventListener('change', async () => {
+    const f = input.files[0];
+    if (!f) return;
+    status.textContent = 'Reading ' + f.name + '…';
+    try {
+      c.text = await fileToText(f); c.source = 'Uploaded: ' + f.name;
+      await save('cases', c);
+      if (!c.citation) identifyCase(c.id);
+      route();
+    } catch (e) { status.textContent = '⚠️ ' + e.message; }
+  });
+  const paste = h('textarea', { placeholder: 'Or paste the opinion text here…' });
+  main.append(h('div', { class: 'card stack' },
+    h('h3', {}, 'Get the full opinion'),
+    h('p', { class: 'muted', style: 'margin:0' }, 'I’ll look on free sources (CourtListener, Justia, and others). If it isn’t free online, download it from Westlaw and upload the PDF here.'),
+    auto, status,
+    h('label', { class: 'file' }, input, '📎 Upload from Westlaw (PDF, Word, or text)'),
+    paste,
+    h('button', { class: 'btn', onclick: async () => { if (!paste.value.trim()) return; c.text = paste.value.trim(); c.source = 'Pasted'; await save('cases', c); if (!c.citation) identifyCase(c.id); route(); } }, 'Use pasted text')));
+  if (new URLSearchParams(location.hash.split('?')[1]).get('pull') === '1') auto.click();
+}
+
+/* ---- Reader with highlights ---- */
+
+function renderOpinion(el, c) {
+  el.textContent = '';
+  const anns = [...(c.annotations || [])].sort((a, b) => a.start - b.start);
+  let pos = 0;
+  for (const a of anns) {
+    const start = Math.max(a.start, pos);
+    if (a.end <= start) continue;
+    if (start > pos) el.append(c.text.slice(pos, start));
+    el.append(h('mark', { class: `c-${a.color}${a.note ? ' has-note' : ''}`, 'data-id': a.id }, c.text.slice(start, a.end)));
+    pos = a.end;
+  }
+  el.append(c.text.slice(pos));
+}
+
+function offsetsIn(container, range) {
+  if (!container.contains(range.startContainer) || !container.contains(range.endContainer)) return null;
+  const pre = document.createRange();
+  pre.selectNodeContents(container);
+  pre.setEnd(range.startContainer, range.startOffset);
+  const start = pre.toString().length;
+  const len = range.toString().length;
+  return len ? { start, end: start + len } : null;
+}
+
+let selHandler = null;
+function hideSelbar() {
+  $('#selbar').classList.add('hidden');
+  if (selHandler) { document.removeEventListener('selectionchange', selHandler); selHandler = null; }
+}
+
+function readTab(main, c, p, prop) {
+  const meta = h('div', { class: 'small muted', style: 'margin-bottom:10px' },
+    c.source ? (c.url ? h('a', { href: c.url, target: '_blank', rel: 'noopener' }, 'Source: ' + c.source + ' ↗') : 'Source: ' + c.source) : null,
+    c.fetchNote ? h('div', {}, c.fetchNote) : null,
+    h('div', {}, 'Tip: select any words to highlight, add a note, or ask what they mean.'));
+  const legend = h('div', { class: 'row small', style: 'margin-bottom:10px' }, COLORS.map((x) => h('span', { class: 'row', style: 'gap:4px' }, h('span', { class: 'dot c-' + x.key }), x.label)));
+  const op = h('div', { class: 'opinion', id: 'opinion' });
+  renderOpinion(op, c);
+  main.append(meta, legend, op);
+
+  // Tap a highlight to see / edit / delete it
+  op.addEventListener('click', async (e) => {
+    const m = e.target.closest('mark');
+    if (!m || !window.getSelection().isCollapsed) return;
+    const a = c.annotations.find((x) => x.id === m.dataset.id);
+    if (!a) return;
+    const note = h('textarea', { placeholder: 'Add a note…' }, a.note || '');
+    const colorRow = h('div', { class: 'row', style: 'margin-top:8px' }, COLORS.map((x) => h('button', { class: 'btn slim' + (a.color === x.key ? ' primary' : ''), onclick: (ev) => { a.color = x.key; colorRow.querySelectorAll('button').forEach((b) => b.classList.remove('primary')); ev.currentTarget.classList.add('primary'); } }, h('span', { class: 'dot c-' + x.key }), x.label)));
+    const r = await sheet('Highlight', h('div', {},
+      h('blockquote', { class: 'md', style: 'margin:0 0 8px' }, '“' + a.quote + '”'), colorRow, h('label', { class: 'f' }, 'Note'), note,
+      h('div', { class: 'row', style: 'margin-top:12px' },
+        h('button', { class: 'btn slim', onclick: () => { $('#sheet-root').innerHTML = ''; explainSnippet(c, prop, a.quote); } }, '❓ Explain this'),
+        h('button', { class: 'btn slim danger', onclick: async () => { c.annotations = c.annotations.filter((x) => x.id !== a.id); await save('cases', c); $('#sheet-root').innerHTML = ''; renderOpinion(op, c); } }, 'Delete'))),
+    [{ label: 'Save', run: () => true }]);
+    if (r) { a.note = note.value.trim(); await save('cases', c); renderOpinion(op, c); }
+  });
+
+  // Selection toolbar
+  const bar = $('#selbar');
+  let pending = null;
+  const act = (fn) => (e) => { e.preventDefault(); fn(); };
+  bar.replaceChildren(
+    ...COLORS.map((x) => h('button', { onpointerdown: (e) => e.preventDefault(), onclick: act(() => addAnn(x.key)) }, h('span', { class: 'dot c-' + x.key, style: 'width:18px;height:18px' }), x.label)),
+    h('button', { onpointerdown: (e) => e.preventDefault(), onclick: act(() => addAnn('yellow', true)) }, h('span', { style: 'font-size:17px' }, '✎'), 'Note'),
+    h('button', { onpointerdown: (e) => e.preventDefault(), onclick: act(() => { if (pending) explainSnippet(c, prop, c.text.slice(pending.start, pending.end)); }) }, h('span', { style: 'font-size:17px' }, '❓'), 'Explain'));
+  selHandler = () => {
+    const sel = window.getSelection();
+    if (!sel.rangeCount || sel.isCollapsed) { bar.classList.add('hidden'); return; }
+    const o = offsetsIn(op, sel.getRangeAt(0));
+    if (!o) { bar.classList.add('hidden'); return; }
+    pending = o;
+    bar.classList.remove('hidden');
+  };
+  document.addEventListener('selectionchange', selHandler);
+
+  async function addAnn(color, withNote = false) {
+    if (!pending) return;
+    const quote = c.text.slice(pending.start, pending.end).trim();
+    if (!quote) return;
+    const a = { id: uid(), start: pending.start, end: pending.end, quote, color, note: '', at: Date.now() };
+    window.getSelection().removeAllRanges();
+    bar.classList.add('hidden');
+    if (withNote) {
+      const note = h('textarea', { placeholder: 'Your note…' });
+      const ok = await sheet('Add a note', h('div', {}, h('blockquote', { class: 'md', style: 'margin:0 0 8px' }, '“' + quote + '”'), note), [{ label: 'Save', run: () => true }]);
+      if (!ok) return;
+      a.note = note.value.trim();
+    }
+    c.annotations = [...(c.annotations || []), a];
+    await save('cases', c);
+    renderOpinion(op, c);
+    toast('Highlighted');
+  }
+
+  const focus = new URLSearchParams(location.hash.split('?')[1]).get('focus');
+  if (focus) setTimeout(() => { const m = op.querySelector(`mark[data-id="${focus}"]`); if (m) { m.scrollIntoView({ block: 'center' }); m.classList.add('flash'); setTimeout(() => m.classList.remove('flash'), 1800); } }, 50);
+}
+
+async function explainSnippet(c, prop, snippet) {
+  const i = c.text.indexOf(snippet);
+  const around = i >= 0 ? c.text.slice(Math.max(0, i - 600), i + snippet.length + 600) : '';
+  const short = snippet.length < 60 && !/[.;:]/.test(snippet);
+  const q = short
+    ? `What does “${snippet}” mean here? Define it in plain English, then explain what it means in this specific part of the opinion and why it matters.`
+    : `Explain this passage from the opinion in plain English, step by step:\n\n“${snippet}”\n\nWhat is the court saying, what is it based on, and why does it matter${prop ? ' for my point: ' + prop.text : ''}?`;
+  c.pendingQuestion = { q, context: around };
+  await save('cases', c);
+  go(`#/c/${c.id}?tab=chat${prop ? '&prop=' + prop.id : ''}`);
+}
+
+/* ---- Breakdown ---- */
+
+function breakdownTab(main, c, p) {
+  const out = h('div', { class: 'md' });
+  const btn = h('button', { class: 'btn primary big', onclick: run }, c.breakdown ? '↻ Redo breakdown' : '🧠 Break this case down for me');
+  main.append(h('div', { class: 'card' }, c.breakdown ? out : h('p', { class: 'muted', style: 'margin-top:0' }, 'A plain-English walkthrough: the story, the question, the rule, the court’s reasoning step by step, legal terms defined, and a hypothetical.'), c.breakdown ? null : out), btn);
+  if (c.breakdown) out.innerHTML = md(c.breakdown);
+
+  async function run() {
+    const done = busy(btn, 'Breaking it down…');
+    if (!out.isConnected) main.firstChild.replaceChildren(out);
+    try {
+      const r = await streamInto(out, {
+        system: systemFor(p, c),
+        messages: [{ role: 'user', content: `Break this case down for me using exactly these sections:
+
+## The bottom line
+(2–3 sentences: who won, and the one rule this case stands for.)
+## The story (facts)
+(Only the facts that mattered to the decision.)
+## How it got here (procedural posture)
+(What happened below and what kind of motion/appeal this is — and what standard of review applied, explained simply.)
+## The question the court had to answer
+## Legal terms, defined
+(Every term of art used in the opinion that I might not know.)
+## The rule of law
+(The proposition of law this case stands for, in one or two sentences I could put in a brief.)
+## How the court got there — step by step
+(A numbered chain: "1. The rule is… 2. So the court asked… 3. Here, the facts showed… 4. Therefore…". For each step, say what the court based it on — statute, earlier case, policy, or a specific fact.)
+## What the court decided
+(Holding and outcome. Note any concurrence or dissent and why it matters.)
+## A hypothetical to make it click
+## Watch-outs
+(What's dicta vs. holding; limits on the case; how the other side might distinguish it; whether it's binding in ${p.court || 'my court'}.)
+## Best quotes
+(Exact words from the opinion, with star pages if shown.)` }],
+      });
+      c.breakdown = r.text;
+      await save('cases', c);
+    } catch {}
+    done();
+    btn.textContent = '↻ Redo breakdown';
+  }
+}
+
+/* ---- Support check ---- */
+
+async function runSupportCheck(p, c, prop, outEl) {
+  const r = await streamInto(outEl, {
+    system: systemFor(p, c),
+    messages: [{ role: 'user', content: `Does this case support this point in my brief?
+
+MY POINT: ${prop.text}
+SECTION: ${prop.section || ''}
+${prop.bracket ? 'MY RESEARCH NOTE: ' + prop.bracket : ''}
+
+Start your answer with exactly one line: "VERDICT: strong" or "VERDICT: partial" or "VERDICT: weak" or "VERDICT: none" or "VERDICT: against" (weak = only in dicta or only by analogy; against = it actually hurts us). Then:
+
+## The short answer
+## Why — step by step
+(If the case says X, and my point is Y, here's how you get from X to Y — or where the chain breaks.)
+## The exact language that helps
+(Word-for-word quotes with star pages if shown.)
+## Problems and gaps
+(Different facts, different procedural posture, dicta, different jurisdiction, later limits.)
+## How to phrase my point so it's accurate to this case
+## Suggested citation
+(Bluebook, with a short explanatory parenthetical.)` }],
+  });
+  const verdict = (r.text.match(/VERDICT:\s*(strong|partial|weak|none|against)/i)?.[1] || '').toLowerCase();
+  const text = r.text.replace(/^\s*VERDICT:.*\n?/i, '').trim();
+  outEl.innerHTML = md(text);
+  const fresh = await db.get('cases', c.id);
+  fresh.support = { ...(fresh.support || {}), [prop.id]: { verdict, text, at: Date.now() } };
+  await save('cases', fresh);
+  Object.assign(c, fresh);
+  return { verdict, text };
+}
+
+function supportTab(main, c, p, prop) {
+  const props = p.props || [];
+  if (!props.length) {
+    main.append(h('p', { class: 'muted' }, 'Add points to your project first (from your draft), then check this case against them.'));
+    return;
+  }
+  const sel = h('select', {}, props.map((x) => h('option', { value: x.id, selected: prop ? x.id === prop.id : false }, (c.support?.[x.id] ? '✓ ' : '') + x.text.slice(0, 110))));
+  const verdictEl = h('div', { class: 'row', style: 'margin:10px 0' });
+  const out = h('div', { class: 'md' });
+  const btn = h('button', { class: 'btn primary big' }, '⚖️ Does this case support my point?');
+  const show = () => {
+    const s = c.support?.[sel.value];
+    verdictEl.replaceChildren(s ? verdictBadge(s.verdict) || '' : '');
+    out.innerHTML = s ? md(s.text) : '';
+    btn.textContent = s ? '↻ Check again' : '⚖️ Does this case support my point?';
+  };
+  sel.addEventListener('change', show);
+  btn.addEventListener('click', async () => {
+    const pr = props.find((x) => x.id === sel.value);
+    const done = busy(btn, 'Checking…');
+    try {
+      const r = await runSupportCheck(p, c, pr, out);
+      verdictEl.replaceChildren(verdictBadge(r.verdict) || '');
+      const fresh = await db.get('projects', p.id);
+      const fp = fresh.props.find((x) => x.id === pr.id);
+      if (fp && !fp.caseIds.includes(c.id)) { fp.caseIds.push(c.id); await save('projects', fresh); }
+    } catch {}
+    done();
+    btn.textContent = '↻ Check again';
+  });
+  main.append(h('div', { class: 'card' }, h('label', { class: 'f', style: 'margin-top:0' }, 'Which point in your brief?'), sel, verdictEl, out), btn);
+  show();
+}
+
+/* ---- Chat ---- */
+
+function chatTab(main, c, p, prop) {
+  const list = h('div', { class: 'chat' });
+  const draw = () => {
+    list.replaceChildren(...(c.chat || []).map((m) => m.role === 'user'
+      ? h('div', { class: 'msg user' }, m.display || m.content)
+      : h('div', { class: 'msg assistant md', html: md(m.content) })));
+    if (!c.chat?.length) list.append(h('p', { class: 'muted' }, 'Ask anything about this case. I’ve read the whole opinion and your draft brief.'));
+  };
+  draw();
+  const input = h('textarea', { placeholder: 'Ask about this case…', rows: 1 });
+  input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; });
+  const send = h('button', { class: 'btn primary', 'aria-label': 'Send' }, '↑');
+  const quick = [
+    'What are the key facts?',
+    'What’s the holding in one sentence?',
+    'How could the other side distinguish this case?',
+    `Is this case binding in ${p.court || 'my court'}?`,
+    prop ? 'How exactly does this help my point?' : 'What is this case best cited for?',
+    'Explain the standard of review here.',
+  ];
+  const composer = h('div', { class: 'composer' },
+    h('div', { class: 'quick' }, quick.map((q) => h('button', { class: 'chip', onclick: () => ask(q) }, q))),
+    h('div', { class: 'in' }, input, send));
+  const clear = h('button', { class: 'btn slim', style: 'margin-top:14px', onclick: async () => { if (!confirm('Clear this conversation?')) return; c.chat = []; await save('cases', c); draw(); } }, 'Clear chat');
+  main.style.paddingBottom = '190px';
+  main.append(list, c.chat?.length ? clear : '', composer);
+  send.addEventListener('click', () => ask(input.value));
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !('ontouchstart' in window)) { e.preventDefault(); ask(input.value); } });
+
+  let running = false;
+  async function ask(text, context) {
+    text = (text || '').trim();
+    if (!text || running) return;
+    running = true;
+    input.value = ''; input.style.height = '';
+    const content = (prop ? `(I'm working on this point: ${prop.text})\n\n` : '') + (context ? `Surrounding text from the opinion, for context:\n"""${context}"""\n\n` : '') + text;
+    c.chat = [...(c.chat || []), { role: 'user', content, display: text }];
+    draw();
+    const out = h('div', { class: 'msg assistant md' });
+    list.querySelector('p.muted')?.remove();
+    list.append(out);
+    out.scrollIntoView({ block: 'end', behavior: 'smooth' });
+    try {
+      const r = await streamInto(out, { system: systemFor(p, c), messages: c.chat.map((m) => ({ role: m.role, content: m.content })) });
+      c.chat.push({ role: 'assistant', content: r.text });
+      await save('cases', c);
+    } catch {
+      c.chat.pop(); // drop the unanswered question so the conversation stays valid
+      await save('cases', c);
+    }
+    running = false;
+  }
+
+  if (c.pendingQuestion) {
+    const { q, context } = c.pendingQuestion;
+    delete c.pendingQuestion;
+    save('cases', c).then(() => ask(q, context));
+  }
+}
+
+/* ---- Notes ---- */
+
+function notesTab(main, c, propId) {
+  const anns = [...(c.annotations || [])].sort((a, b) => a.start - b.start);
+  if (!anns.length) {
+    main.append(h('p', { class: 'muted' }, 'No highlights yet. In the Read tab, select words to highlight them or add a note.'));
+    return;
+  }
+  const all = anns.map((a) => `“${a.quote}”${a.note ? '\n  — ' + a.note : ''}`).join('\n\n');
+  main.append(h('button', { class: 'btn big', onclick: () => copyText(`${caseTitle(c)}${c.citation ? ', ' + c.citation : ''}\n\n${all}`) }, '📋 Copy all notes'));
+  for (const kind of COLORS) {
+    const group = anns.filter((a) => a.color === kind.key);
+    if (!group.length) continue;
+    main.append(h('div', { class: 'section-title row', style: 'gap:6px' }, h('span', { class: 'dot c-' + kind.key }), kind.label));
+    for (const a of group) {
+      main.append(h('div', { class: 'card tap', onclick: () => go(`#/c/${c.id}?tab=read&focus=${a.id}${propId ? '&prop=' + propId : ''}`) },
+        h('div', { class: 'pre', style: 'font-size:15px' }, '“' + a.quote + '”'),
+        a.note ? h('div', { class: 'small', style: 'margin-top:6px' }, '✎ ' + a.note) : null));
+    }
+  }
+}
+
+/* ============================== Start ============================== */
+
+marked.setOptions({ gfm: true, breaks: false });
+route();
