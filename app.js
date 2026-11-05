@@ -1307,7 +1307,10 @@ async function viewCase(cid, tab, propId) {
   const menu = h('button', { class: 'iconbtn', 'aria-label': 'Case menu', onclick: () => caseMenu(c) }, '⋯');
   const main = h('main', {});
   const items = [['read', 'Read'], ['breakdown', 'Break it down'], ...(p.quick ? [] : [['support', 'Support?']]), ['chat', 'Ask'], ['notes', `Notes (${c.annotations?.length || 0})`]];
-  app.replaceChildren(header(caseTitle(c), back, [c.citation, c.court, c.year].filter(Boolean).join(' · ') || null, menu), tabs(items, tab, qs), main);
+  const hdr = header(caseTitle(c), back, [c.citation, c.court, c.year].filter(Boolean).join(' · ') || null, menu);
+  hdr.classList.add('compact');
+  if (!p.quick && p.props?.length) hdr.append(propBar(p, c, prop, tab));
+  app.replaceChildren(hdr, tabs(items, tab, qs), main);
 
   if (!c.text) return getCasePanel(main, c, p);
 
@@ -1316,6 +1319,26 @@ async function viewCase(cid, tab, propId) {
   if (tab === 'support') return supportTab(main, c, p, prop);
   if (tab === 'chat') return chatTab(main, c, p, prop);
   if (tab === 'notes') return notesTab(main, c, propId);
+}
+
+/** Pinned bar under the case title showing the point you're researching. */
+function propBar(p, c, prop, tab) {
+  const pick = async () => {
+    const list = h('div', { class: 'stack' }, (p.props || []).map((x) => h('button', {
+      class: 'pickprop' + (prop && x.id === prop.id ? ' on' : ''),
+      onclick: () => { $('#sheet-root').innerHTML = ''; go(`#/c/${c.id}?tab=${tab}&prop=${x.id}`); },
+    }, x.section ? h('div', { class: 'small muted' }, x.section) : null, x.text)));
+    await sheet('Which point are you researching?', list, []);
+  };
+  if (!prop) return h('div', { class: 'propbar' }, h('button', { class: 'pchoose', onclick: pick }, '＋ Pin the point you’re researching'));
+  const sup = c.support?.[prop.id];
+  const text = h('div', { class: 'ptext clamp', onclick: () => text.classList.toggle('clamp') }, prop.text);
+  return h('div', { class: 'propbar' },
+    h('div', { class: 'phead' },
+      h('span', { class: 'plabel' }, 'Your point'),
+      sup ? verdictBadge(sup.verdict) : null,
+      h('button', { class: 'pswitch', onclick: pick }, 'Change')),
+    text);
 }
 
 async function caseMenu(c) {
@@ -1382,7 +1405,7 @@ function getCasePanel(main, c, p) {
 
 /* ---- Reader: cleaned-up text, tap-a-sentence highlighting ---- */
 
-const TEXT_FORMAT = 2; // bump when normalizeOpinion changes
+const TEXT_FORMAT = 3; // bump when normalizeOpinion changes
 
 const isHeadingLine = (k) => k.length < 90 && (
   (/[A-Z]{3}/.test(k) && k === k.toUpperCase() && !/[.;,]$/.test(k)) ||
@@ -1416,7 +1439,7 @@ function normalizeOpinion(raw) {
   for (const l of lines) {
     if (!l.trim()) { blank = true; continue; }
     const k = l.trim().replace(/\s+/g, ' ');
-    const midSentence = cur && (/[-–]$/.test(cur) || (!/[.:?!;"”’)\]]$/.test(cur) && /^[a-z(,;]/.test(k)));
+    const midSentence = cur && !(blank && FOOTNOTE.test(cur)) && (/[-–]$/.test(cur) || (!/[.:?!;"”’)\]]$/.test(cur) && /^[a-z(,;]/.test(k)));
     const start = !cur || PARA_MARK.test(k) || isHeadingLine(k) || isHeadingLine(prev) ||
       (!midSentence && (blank || (useIndent && indentOf(l) >= 2) ||
         (/[.:?!]["”’)]?$/.test(prev) && prev.length < median * 0.7)));
@@ -1426,7 +1449,23 @@ function normalizeOpinion(raw) {
     prev = k; blank = false;
   }
   if (cur) paras.push(cur);
-  return paras.join('\n\n');
+  return mendFootnoteBreaks(paras).join('\n\n');
+}
+
+// Footnotes at the bottom of a PDF page land in the middle of a paragraph that continues
+// on the next page. Rejoin the paragraph and move the footnote(s) after it.
+const FOOTNOTE = /^\d{1,2}\s+(?:[A-Z"“(]|See\b)/;
+function mendFootnoteBreaks(paras) {
+  const out = [...paras];
+  for (let i = 0; i < out.length - 1; i++) {
+    if (/[.:?!"”’)\]]$/.test(out[i]) || isHeadingLine(out[i])) continue;
+    let j = i + 1;
+    const notes = [];
+    while (j < out.length && j - i <= 4 && FOOTNOTE.test(out[j])) notes.push(out[j++]);
+    if (!notes.length || j >= out.length || !/^[a-z(,;]/.test(out[j])) continue;
+    out.splice(i, j - i + 1, out[i] + ' ' + out[j], ...notes);
+  }
+  return out;
 }
 
 // Words that end with a period but don't end a sentence (legal citations are full of them).
@@ -1511,7 +1550,7 @@ function renderOpinion(el, c) {
     base += para.length + 2;
     if (!para.trim()) continue;
     const heading = isHeadingLine(para.trim());
-    const block = h(heading ? 'h3' : 'p', {});
+    const block = h(heading ? 'h3' : 'p', { class: !heading && FOOTNOTE.test(para) && para.length < 1500 ? 'fn' : null });
     let from = 0;
     const m = !heading && para.match(PARA_MARK);
     if (m) { block.append(h('span', { class: 'pnum' }, m[1].replace(/[{}]/g, '').replace(/\s+/g, ''))); from = m[0].length; }
