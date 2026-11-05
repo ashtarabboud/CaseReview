@@ -1333,7 +1333,7 @@ async function caseMenu(c) {
   const replace = h('button', { class: 'btn', style: 'margin-top:16px; margin-right:8px', onclick: async () => {
     if (c.annotations?.length && !confirm('Replacing the text removes your highlights on this case. Continue?')) return;
     $('#sheet-root').innerHTML = '';
-    c.text = ''; c.annotations = []; c.breakdown = ''; await save('cases', c); route();
+    c.text = ''; c.fmt = 0; c.annotations = []; c.breakdown = ''; await save('cases', c); route();
   } }, '↻ Replace case text');
   const ok = await sheet('Case details', h('div', {},
     h('label', { class: 'f' }, 'Case name'), name, h('label', { class: 'f' }, 'Citation'), cite,
@@ -1380,109 +1380,353 @@ function getCasePanel(main, c, p) {
   if (new URLSearchParams(location.hash.split('?')[1]).get('pull') === '1') auto.click();
 }
 
-/* ---- Reader with highlights ---- */
+/* ---- Reader: cleaned-up text, tap-a-sentence highlighting ---- */
+
+const TEXT_FORMAT = 2; // bump when normalizeOpinion changes
+
+const isHeadingLine = (k) => k.length < 90 && (
+  (/[A-Z]{3}/.test(k) && k === k.toUpperCase() && !/[.;,]$/.test(k)) ||
+  /^(?:[IVXL]+|[A-H])\.\s+[A-Z][^.;]*$/.test(k)
+);
+const PARA_MARK = /^(\{¶\s*\d+\}|¶\s*\d+\.?|\[\d+\])\s*/;
+
+/** Turn raw opinion text (hard-wrapped lines, tabs, page headers) into clean paragraphs separated by blank lines. */
+function normalizeOpinion(raw) {
+  let lines = raw.replace(/\r\n?/g, '\n').replace(/[   ]/g, ' ').replace(/[​﻿]/g, '').split('\n');
+  // Drop running headers/footers (short lines repeated 3+ times) and bare page numbers.
+  const counts = new Map();
+  for (const l of lines) { const k = l.trim(); if (k && k.length < 70) counts.set(k, (counts.get(k) || 0) + 1); }
+  const pageNum = /^(?:[-–—]\s*)?(?:page\s+)?\d{1,3}(?:\s*[-–—])?$|^\d+\s+of\s+\d+$/i;
+  lines = lines.filter((l) => {
+    const k = l.trim();
+    if (!k) return true;
+    if (pageNum.test(k)) return false;
+    const looksLikeHeader = /\d/.test(k) || / v\. /.test(k) || (k === k.toUpperCase() && /[A-Z]{3}/.test(k)) || /^(case|no\.|page|docket)/i.test(k);
+    return !(counts.get(k) >= 3 && looksLikeHeader && !/[.;:,]$/.test(k) && !PARA_MARK.test(k) && !/^[*\s]+$/.test(k));
+  });
+  const indentOf = (l) => l.match(/^[ \t]*/)[0].replace(/\t/g, '    ').length;
+  const nonblank = lines.filter((l) => l.trim());
+  const indented = nonblank.filter((l) => indentOf(l) >= 2).length;
+  const useIndent = indented > 0 && indented / nonblank.length < 0.4;
+  const lens = nonblank.map((l) => l.trim().length).filter((n) => n > 25).sort((a, b) => a - b);
+  const median = lens[lens.length >> 1] || 80;
+
+  const paras = [];
+  let cur = '', prev = '', blank = true;
+  for (const l of lines) {
+    if (!l.trim()) { blank = true; continue; }
+    const k = l.trim().replace(/\s+/g, ' ');
+    const midSentence = cur && (/[-–]$/.test(cur) || (!/[.:?!;"”’)\]]$/.test(cur) && /^[a-z(,;]/.test(k)));
+    const start = !cur || PARA_MARK.test(k) || isHeadingLine(k) || isHeadingLine(prev) ||
+      (!midSentence && (blank || (useIndent && indentOf(l) >= 2) ||
+        (/[.:?!]["”’)]?$/.test(prev) && prev.length < median * 0.7)));
+    if (start) { if (cur) paras.push(cur); cur = k; }
+    else if (/\S[-–]$/.test(cur)) cur += k; // line broke right after a hyphen (e.g. "2024-" / "Ohio-2133")
+    else cur += ' ' + k;
+    prev = k; blank = false;
+  }
+  if (cur) paras.push(cur);
+  return paras.join('\n\n');
+}
+
+// Words that end with a period but don't end a sentence (legal citations are full of them).
+const ABBR = new Set(("v vs inc co corp ltd llc no nos st ct app dist cir supp ed eds mr mrs ms dr jr sr rev stat ann civ crim gen sec secs art " +
+  "fed jud admin prac proc evid const amend cl ch pt vol cf al approx dept div bd educ comm assn ass'n univ hosp mfg nat'l int'l " +
+  "elec ins tel prop dev ctr cty twp mun sup super prob juv dom rel misc fig para pp nn fn hon atty gov sens rep reps cmty servs " +
+  "sys tech transp util indus inv invs mgmt mktg agric bus coll envtl fin rptr nom atl pac am amer auth bros cas cent chem coop " +
+  "distrib econ eng'g equip exch grp guar hous indem info lab liab maint med merch metro mut org pharm prods pub reg rd rest ry " +
+  "sch soc sur temp unemp ave blvd ft mt pres prof sgt lt capt col messrs cnty comm'n comm'r dep't gov't sav ass'ns " +
+  "ala ariz ark cal colo conn del fla ga haw ill ind kan ky la md mass mich minn miss mo mont neb nev okla or pa tenn tex vt va " +
+  "wash wis wyo ne nw se sw subd subds supp div'l cert den reh'g aff'd rev'd vacated cir'g").split(' '));
+
+/** Split a paragraph into sentences. Returns [start, end] index pairs (end exclusive, no surrounding spaces). */
+function segmentSentences(p, from = 0) {
+  const out = [];
+  const skipWs = (i) => { while (i < p.length && /\s/.test(p[i])) i++; return i; };
+  let start = skipWs(from);
+  const re = /[.?!]+["”’)\]]*(?=\s+(?:["“‘(\[]?[A-Z]|\{¶|¶))/g;
+  re.lastIndex = start;
+  let m;
+  while ((m = re.exec(p))) {
+    const end = m.index + m[0].length;
+    if (m[0][0] === '.') {
+      const w = (p.slice(start, m.index).match(/([A-Za-z.'’]+)$/) || [])[1] || '';
+      const wl = w.toLowerCase().replace(/’/g, "'");
+      if (w.length === 1 || ABBR.has(wl) || /\.[A-Za-z]{1,3}$/.test(w)) continue; // initials, U.S., L.L.C., e.g.
+    }
+    if (end - start < 3) continue;
+    out.push([start, end]);
+    start = skipWs(end);
+  }
+  let end = p.length;
+  while (end > start && /\s/.test(p[end - 1])) end--;
+  if (end > start) out.push([start, end]);
+  return out;
+}
+
+/** Make sure a case's text is in the clean format; remap old highlights onto it. */
+async function ensureCleanText(c) {
+  if (!c.text || c.fmt === TEXT_FORMAT) return;
+  const clean = normalizeOpinion(c.text);
+  const squash = (s) => s.replace(/\s+/g, ' ').trim();
+  c.annotations = (c.annotations || []).map((a) => {
+    const q = squash(a.quote);
+    let i = clean.indexOf(q);
+    if (i < 0) i = clean.indexOf(q.replace(/- /g, '-'));
+    return i < 0 ? null : { ...a, start: i, end: i + q.length, quote: q };
+  }).filter(Boolean);
+  c.text = clean;
+  c.fmt = TEXT_FORMAT;
+  await save('cases', c);
+}
+
+function appendText(parent, str) {
+  // Style star pages (*123 / **45) so they're visible but quiet.
+  const parts = str.split(/(\*{1,2}\d{1,4}\b)/);
+  parts.forEach((t, i) => { if (!t) return; parent.append(i % 2 ? h('span', { class: 'star' }, t) : t); });
+}
+
+function fillSentence(span, c) {
+  const s = +span.dataset.s, e = +span.dataset.e;
+  span.textContent = '';
+  const anns = (c.annotations || []).filter((a) => a.end > s && a.start < e).sort((a, b) => a.start - b.start);
+  let pos = s;
+  for (const a of anns) {
+    const from = Math.max(a.start, pos), to = Math.min(a.end, e);
+    if (to <= from) continue;
+    if (from > pos) appendText(span, c.text.slice(pos, from));
+    const mark = h('mark', { class: `c-${a.color}${a.note ? ' has-note' : ''}`, 'data-id': a.id });
+    appendText(mark, c.text.slice(from, to));
+    span.append(mark);
+    pos = to;
+  }
+  if (pos < e) appendText(span, c.text.slice(pos, e));
+}
 
 function renderOpinion(el, c) {
   el.textContent = '';
-  const anns = [...(c.annotations || [])].sort((a, b) => a.start - b.start);
-  let pos = 0;
-  for (const a of anns) {
-    const start = Math.max(a.start, pos);
-    if (a.end <= start) continue;
-    if (start > pos) el.append(c.text.slice(pos, start));
-    el.append(h('mark', { class: `c-${a.color}${a.note ? ' has-note' : ''}`, 'data-id': a.id }, c.text.slice(start, a.end)));
-    pos = a.end;
+  let base = 0;
+  for (const para of c.text.split('\n\n')) {
+    const pStart = base;
+    base += para.length + 2;
+    if (!para.trim()) continue;
+    const heading = isHeadingLine(para.trim());
+    const block = h(heading ? 'h3' : 'p', {});
+    let from = 0;
+    const m = !heading && para.match(PARA_MARK);
+    if (m) { block.append(h('span', { class: 'pnum' }, m[1].replace(/[{}]/g, '').replace(/\s+/g, ''))); from = m[0].length; }
+    for (const [s, e] of segmentSentences(para, from)) {
+      const span = h('span', { class: 's', 'data-s': pStart + s, 'data-e': pStart + e });
+      fillSentence(span, c);
+      block.append(span, ' ');
+    }
+    el.append(block);
   }
-  el.append(c.text.slice(pos));
 }
 
-function offsetsIn(container, range) {
-  if (!container.contains(range.startContainer) || !container.contains(range.endContainer)) return null;
-  const pre = document.createRange();
-  pre.selectNodeContents(container);
-  pre.setEnd(range.startContainer, range.startOffset);
-  const start = pre.toString().length;
-  const len = range.toString().length;
-  return len ? { start, end: start + len } : null;
+function refreshSentences(root, c, start, end) {
+  root.querySelectorAll('.s').forEach((span) => {
+    if (+span.dataset.e > start && +span.dataset.s < end) fillSentence(span, c);
+  });
+}
+
+/** Absolute text offset for a DOM position inside a sentence span. */
+function absOffset(node, offset) {
+  const el = node.nodeType === 1 ? node : node.parentElement;
+  const span = el?.closest('.s');
+  if (!span) return null;
+  const r = document.createRange();
+  r.selectNodeContents(span);
+  r.setEnd(node, offset);
+  return +span.dataset.s + r.toString().length;
 }
 
 let selHandler = null;
+let scrollHandler = null;
 function hideSelbar() {
   $('#selbar').classList.add('hidden');
   if (selHandler) { document.removeEventListener('selectionchange', selHandler); selHandler = null; }
+  if (scrollHandler) { window.removeEventListener('scroll', scrollHandler); scrollHandler = null; }
+  document.getElementById('readprog')?.remove();
+  delete document.body.dataset.reading;
 }
 
-function readTab(main, c, p, prop) {
-  const meta = h('div', { class: 'small muted', style: 'margin-bottom:10px' },
-    c.source ? (c.url ? h('a', { href: c.url, target: '_blank', rel: 'noopener' }, 'Source: ' + c.source + ' ↗') : 'Source: ' + c.source) : null,
-    c.fetchNote ? h('div', {}, c.fetchNote) : null,
-    h('div', {}, 'Tip: select any words to highlight, add a note, or ask what they mean.'));
-  const legend = h('div', { class: 'row small', style: 'margin-bottom:10px' }, COLORS.map((x) => h('span', { class: 'row', style: 'gap:4px' }, h('span', { class: 'dot c-' + x.key }), x.label)));
-  const op = h('div', { class: 'opinion', id: 'opinion' });
-  renderOpinion(op, c);
-  main.append(meta, legend, op);
+const READER_DEFAULTS = { size: 19, font: 'serif', theme: 'paper', pen: 'yellow' };
+const R = {
+  get() { try { return { ...READER_DEFAULTS, ...JSON.parse(localStorage.getItem('cr.reader') || '{}') }; } catch { return { ...READER_DEFAULTS }; } },
+  set(patch) { localStorage.setItem('cr.reader', JSON.stringify({ ...R.get(), ...patch })); },
+};
 
-  // Tap a highlight to see / edit / delete it
-  op.addEventListener('click', async (e) => {
-    const m = e.target.closest('mark');
-    if (!m || !window.getSelection().isCollapsed) return;
-    const a = c.annotations.find((x) => x.id === m.dataset.id);
-    if (!a) return;
-    const note = h('textarea', { placeholder: 'Add a note…' }, a.note || '');
-    const colorRow = h('div', { class: 'row', style: 'margin-top:8px' }, COLORS.map((x) => h('button', { class: 'btn slim' + (a.color === x.key ? ' primary' : ''), onclick: (ev) => { a.color = x.key; colorRow.querySelectorAll('button').forEach((b) => b.classList.remove('primary')); ev.currentTarget.classList.add('primary'); } }, h('span', { class: 'dot c-' + x.key }), x.label)));
-    const r = await sheet('Highlight', h('div', {},
-      h('blockquote', { class: 'md', style: 'margin:0 0 8px' }, '“' + a.quote + '”'), colorRow, h('label', { class: 'f' }, 'Note'), note,
-      h('div', { class: 'row', style: 'margin-top:12px' },
-        h('button', { class: 'btn slim', onclick: () => { $('#sheet-root').innerHTML = ''; explainSnippet(c, prop, a.quote); } }, '❓ Explain this'),
-        h('button', { class: 'btn slim danger', onclick: async () => { c.annotations = c.annotations.filter((x) => x.id !== a.id); await save('cases', c); $('#sheet-root').innerHTML = ''; renderOpinion(op, c); } }, 'Delete'))),
-    [{ label: 'Save', run: () => true }]);
-    if (r) { a.note = note.value.trim(); await save('cases', c); renderOpinion(op, c); }
+function applyReader(el) {
+  const r = R.get();
+  el.style.setProperty('--rsize', r.size + 'px');
+  el.dataset.font = r.font;
+  el.dataset.theme = r.theme;
+  document.body.dataset.reading = r.theme;
+}
+
+async function readTab(main, c, p, prop) {
+  await ensureCleanText(c);
+  main.classList.add('reading');
+  const op = h('article', { class: 'reader', id: 'opinion' });
+  applyReader(op);
+  renderOpinion(op, c);
+
+  const source = c.source ? (c.url ? h('a', { href: c.url, target: '_blank', rel: 'noopener' }, c.source + ' ↗') : c.source) : null;
+  main.append(
+    h('div', { class: 'readbar' },
+      h('div', { class: 'small muted grow' }, source ? ['Source: ', source] : null),
+      h('button', { class: 'btn slim', 'aria-label': 'Text settings', onclick: textSettings }, 'Aa')),
+    ...(c.fetchNote ? [h('p', { class: 'small muted' }, c.fetchNote)] : []),
+    op);
+
+  // Reading progress bar
+  const prog = h('div', { id: 'readprog', class: 'readprog' });
+  document.body.append(prog);
+  scrollHandler = () => {
+    const max = document.documentElement.scrollHeight - innerHeight;
+    prog.style.width = (max > 0 ? Math.min(100, (scrollY / max) * 100) : 0) + '%';
+  };
+  window.addEventListener('scroll', scrollHandler, { passive: true });
+
+  // Pen tray (bottom)
+  const bar = $('#selbar');
+  const drawTray = () => {
+    const pen = R.get().pen;
+    bar.className = 'selbar tray';
+    bar.replaceChildren(
+      h('button', { class: pen === 'none' ? 'on' : '', onclick: () => { R.set({ pen: 'none' }); drawTray(); toast('Reading mode — tap a sentence for options'); } }, h('span', { class: 'penicon' }, '👁'), 'Read'),
+      ...COLORS.map((x) => h('button', { class: pen === x.key ? 'on' : '', onclick: () => { R.set({ pen: x.key }); drawTray(); } }, h('span', { class: 'dot c-' + x.key, style: 'width:20px;height:20px' }), x.label)));
+  };
+  drawTray();
+
+  // Tap a sentence → highlight it with the current pen. Tap a highlight → options.
+  op.addEventListener('click', (e) => {
+    if (!window.getSelection().isCollapsed) return;
+    const mark = e.target.closest('mark');
+    if (mark) return openHighlight(c.annotations.find((x) => x.id === mark.dataset.id));
+    const span = e.target.closest('.s');
+    if (!span) return;
+    const s = +span.dataset.s, en = +span.dataset.e;
+    const pen = R.get().pen;
+    if (pen === 'none') return sentenceSheet(s, en);
+    addAnn(s, en, pen);
   });
 
-  // Selection toolbar
-  const bar = $('#selbar');
+  // Long-press selection still works for highlighting just a few words.
   let pending = null;
-  const act = (fn) => (e) => { e.preventDefault(); fn(); };
-  bar.replaceChildren(
-    ...COLORS.map((x) => h('button', { onpointerdown: (e) => e.preventDefault(), onclick: act(() => addAnn(x.key)) }, h('span', { class: 'dot c-' + x.key, style: 'width:18px;height:18px' }), x.label)),
-    h('button', { onpointerdown: (e) => e.preventDefault(), onclick: act(() => addAnn('yellow', true)) }, h('span', { style: 'font-size:17px' }, '✎'), 'Note'),
-    h('button', { onpointerdown: (e) => e.preventDefault(), onclick: act(() => { if (pending) explainSnippet(c, prop, c.text.slice(pending.start, pending.end)); }) }, h('span', { style: 'font-size:17px' }, '❓'), 'Explain'));
   selHandler = () => {
     const sel = window.getSelection();
-    if (!sel.rangeCount || sel.isCollapsed) { bar.classList.add('hidden'); return; }
-    const o = offsetsIn(op, sel.getRangeAt(0));
-    if (!o) { bar.classList.add('hidden'); return; }
-    pending = o;
-    bar.classList.remove('hidden');
+    if (!sel.rangeCount || sel.isCollapsed) { pending = null; drawTray(); return; }
+    const rg = sel.getRangeAt(0);
+    const a = absOffset(rg.startContainer, rg.startOffset), b = absOffset(rg.endContainer, rg.endOffset);
+    if (a == null || b == null || b <= a) return;
+    pending = { start: a, end: b };
+    bar.className = 'selbar';
+    bar.replaceChildren(
+      ...COLORS.map((x) => h('button', { onpointerdown: (ev) => ev.preventDefault(), onclick: (ev) => { ev.preventDefault(); const pd = pending; window.getSelection().removeAllRanges(); if (pd) addAnn(pd.start, pd.end, x.key); } }, h('span', { class: 'dot c-' + x.key, style: 'width:18px;height:18px' }), x.label)),
+      h('button', { onpointerdown: (ev) => ev.preventDefault(), onclick: (ev) => { ev.preventDefault(); if (pending) explainSnippet(c, prop, c.text.slice(pending.start, pending.end)); } }, h('span', { class: 'penicon' }, '❓'), 'Explain'));
   };
   document.addEventListener('selectionchange', selHandler);
 
-  async function addAnn(color, withNote = false) {
-    if (!pending) return;
-    const quote = c.text.slice(pending.start, pending.end).trim();
+  async function addAnn(start, end, color) {
+    const quote = c.text.slice(start, end).trim();
     if (!quote) return;
-    const a = { id: uid(), start: pending.start, end: pending.end, quote, color, note: '', at: Date.now() };
-    window.getSelection().removeAllRanges();
-    bar.classList.add('hidden');
-    if (withNote) {
-      const note = h('textarea', { placeholder: 'Your note…' });
-      const ok = await sheet('Add a note', h('div', {}, h('blockquote', { class: 'md', style: 'margin:0 0 8px' }, '“' + quote + '”'), note), [{ label: 'Save', run: () => true }]);
-      if (!ok) return;
-      a.note = note.value.trim();
-    }
-    c.annotations = [...(c.annotations || []), a];
+    // Replace any highlight that overlaps this range.
+    c.annotations = (c.annotations || []).filter((a) => !(a.end > start && a.start < end));
+    c.annotations.push({ id: uid(), start, end, quote, color, note: '', at: Date.now() });
     await save('cases', c);
-    renderOpinion(op, c);
-    toast('Highlighted');
+    refreshSentences(op, c, start, end);
+    if (navigator.vibrate) navigator.vibrate(8);
+  }
+
+  async function removeAnn(a) {
+    c.annotations = c.annotations.filter((x) => x.id !== a.id);
+    await save('cases', c);
+    refreshSentences(op, c, a.start, a.end);
+  }
+
+  function colorButtons(current, onPick) {
+    const row = h('div', { class: 'colorrow' });
+    for (const x of COLORS) {
+      row.append(h('button', { class: 'colorbtn' + (current === x.key ? ' on' : ''), onclick: (ev) => {
+        row.querySelectorAll('.colorbtn').forEach((b) => b.classList.remove('on'));
+        ev.currentTarget.classList.add('on');
+        onPick(x.key);
+      } }, h('span', { class: 'dot c-' + x.key, style: 'width:16px;height:16px' }), x.label));
+    }
+    return row;
+  }
+
+  function wordAsk(text) {
+    const word = h('input', { type: 'text', placeholder: 'A word or phrase from this sentence…' });
+    return h('div', { class: 'row', style: 'margin-top:10px' }, word,
+      h('button', { class: 'btn slim', onclick: () => { const w = word.value.trim(); if (!w) return; $('#sheet-root').innerHTML = ''; explainSnippet(c, prop, w, text); } }, 'What does this mean?'));
+  }
+
+  async function sentenceSheet(start, end) {
+    const text = c.text.slice(start, end);
+    let color = null;
+    const note = h('textarea', { placeholder: 'Add a note (optional)…', style: 'min-height:80px' });
+    const ok = await sheet('This sentence', h('div', {},
+      h('blockquote', { class: 'quote' }, text),
+      colorButtons(null, (k) => { color = k; }),
+      note,
+      h('div', { class: 'row', style: 'margin-top:10px' },
+        h('button', { class: 'btn slim', onclick: () => { $('#sheet-root').innerHTML = ''; explainSnippet(c, prop, text); } }, '❓ Explain this sentence')),
+      wordAsk(text)), [{ label: 'Save', run: () => true }]);
+    if (ok && (color || note.value.trim())) {
+      await addAnn(start, end, color || 'yellow');
+      const a = c.annotations.at(-1);
+      a.note = note.value.trim();
+      await save('cases', c);
+      refreshSentences(op, c, start, end);
+    }
+  }
+
+  async function openHighlight(a) {
+    if (!a) return;
+    let color = a.color;
+    const note = h('textarea', { placeholder: 'Add a note…', style: 'min-height:80px' }, a.note || '');
+    const ok = await sheet('Highlight', h('div', {},
+      h('blockquote', { class: 'quote' }, a.quote),
+      colorButtons(a.color, (k) => { color = k; }),
+      note,
+      h('div', { class: 'row', style: 'margin-top:10px' },
+        h('button', { class: 'btn slim', onclick: () => { $('#sheet-root').innerHTML = ''; explainSnippet(c, prop, a.quote); } }, '❓ Explain this'),
+        h('button', { class: 'btn slim danger', onclick: async () => { $('#sheet-root').innerHTML = ''; await removeAnn(a); } }, 'Remove highlight')),
+      wordAsk(a.quote)), [{ label: 'Save', run: () => true }]);
+    if (ok) { a.color = color; a.note = note.value.trim(); await save('cases', c); refreshSentences(op, c, a.start, a.end); }
+  }
+
+  async function textSettings() {
+    const r = R.get();
+    const preview = h('p', { class: 'small muted' }, `Text size: ${r.size}`);
+    const set = (patch) => { R.set(patch); applyReader(op); preview.textContent = `Text size: ${R.get().size}`; };
+    const choice = (key, opts) => h('div', { class: 'seg' }, opts.map(([v, label]) => h('button', { class: R.get()[key] === v ? 'on' : '', onclick: (ev) => {
+      set({ [key]: v });
+      ev.currentTarget.parentElement.querySelectorAll('button').forEach((b) => b.classList.remove('on'));
+      ev.currentTarget.classList.add('on');
+    } }, label)));
+    await sheet('Reading settings', h('div', {},
+      h('div', { class: 'row' },
+        h('button', { class: 'btn', onclick: () => set({ size: Math.max(14, R.get().size - 1) }) }, 'A−'),
+        h('button', { class: 'btn', onclick: () => set({ size: Math.min(28, R.get().size + 1) }) }, 'A+'),
+        preview),
+      h('label', { class: 'f' }, 'Font'), choice('font', [['serif', 'Book'], ['sans', 'Clean'], ['dyslexia', 'Easy-read']]),
+      h('label', { class: 'f' }, 'Page'), choice('theme', [['paper', 'Paper'], ['white', 'White'], ['night', 'Night']])),
+    [{ label: 'Done', run: () => true }]);
   }
 
   const focus = new URLSearchParams(location.hash.split('?')[1]).get('focus');
   if (focus) setTimeout(() => { const m = op.querySelector(`mark[data-id="${focus}"]`); if (m) { m.scrollIntoView({ block: 'center' }); m.classList.add('flash'); setTimeout(() => m.classList.remove('flash'), 1800); } }, 50);
+  else if (!localStorage.getItem('cr.tip.tap')) { localStorage.setItem('cr.tip.tap', '1'); toast('Tip: tap any sentence to highlight it. Pick the color at the bottom.', 4500); }
 }
 
-async function explainSnippet(c, prop, snippet) {
-  const i = c.text.indexOf(snippet);
-  const around = i >= 0 ? c.text.slice(Math.max(0, i - 600), i + snippet.length + 600) : '';
+async function explainSnippet(c, prop, snippet, within) {
+  const i = c.text.indexOf(within || snippet);
+  const len = (within || snippet).length;
+  const around = i >= 0 ? c.text.slice(Math.max(0, i - 600), i + len + 600) : '';
   const short = snippet.length < 60 && !/[.;:]/.test(snippet);
   const q = short
     ? `What does “${snippet}” mean here? Define it in plain English, then explain what it means in this specific part of the opinion and why it matters.`
