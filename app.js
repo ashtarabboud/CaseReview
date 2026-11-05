@@ -6,6 +6,8 @@ import DOMPurify from './vendor/purify.es.mjs';
 
 /* ============================== Settings ============================== */
 
+const APP_VERSION = '7';
+
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
 - Explain it like I'm smart but brand new to the topic ("explain it like I'm five" clarity) without dumbing down the law.
@@ -668,6 +670,7 @@ function viewSettings() {
       h('div', { class: 'btns' },
         h('button', { class: 'btn', onclick: exportBackup }, '⬇︎ Export backup'),
         h('label', { class: 'btn' }, '⬆︎ Import backup', h('input', { type: 'file', accept: '.json,application/json', style: 'display:none', onchange: importBackup })))),
+    h('p', { class: 'small muted' }, `App version ${APP_VERSION}`),
     h('p', { class: 'small muted' }, 'Privacy: when you ask for an explanation, your draft and the case text are sent to Anthropic’s API to generate the answer. Anthropic does not train on API data by default. Check your firm’s policy before uploading client-confidential drafts.'));
   app.replaceChildren(header('Settings', '#/'), main);
 
