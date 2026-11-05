@@ -6,7 +6,7 @@ import DOMPurify from './vendor/purify.es.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '9';
+const APP_VERSION = '10';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -280,6 +280,9 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
   return { text, content, message: final };
 }
 
+// Machine-readable case lists (```json …```) are shown as cards, never as raw text — even mid-stream.
+const hideJSON = (t) => t.replace(/```json[\s\S]*?(```|$)/g, '').trim();
+
 /** Stream an answer into an element, rendering Markdown as it arrives. */
 async function streamInto(el, opts) {
   el.innerHTML = '<div class="thinking"><span class="spin"></span> Reading and thinking… (long cases can take a minute)</div>';
@@ -287,12 +290,12 @@ async function streamInto(el, opts) {
   const paint = (t) => {
     pending = t;
     if (paint.raf) return;
-    paint.raf = requestAnimationFrame(() => { paint.raf = 0; el.innerHTML = md(pending); });
+    paint.raf = requestAnimationFrame(() => { paint.raf = 0; el.innerHTML = md(hideJSON(pending)); });
   };
   try {
     const r = await claude({ ...opts, onText: paint });
     cancelAnimationFrame(paint.raf); paint.raf = 0;
-    el.innerHTML = md(r.text);
+    el.innerHTML = md(hideJSON(r.text));
     return r;
   } catch (e) {
     cancelAnimationFrame(paint.raf); paint.raf = 0;
@@ -534,6 +537,59 @@ async function findOrCreateCase(p, cit) {
   }
   return c;
 }
+
+async function deleteCase(c, after) {
+  if (!confirm(`Delete “${caseTitle(c)}” and all its highlights, notes, and chat? This can’t be undone.`)) return false;
+  const p = await db.get('projects', c.projectId);
+  for (const prop of p?.props || []) prop.caseIds = (prop.caseIds || []).filter((x) => x !== c.id);
+  if (p) await save('projects', p);
+  await db.del('cases', c.id);
+  toast('Case deleted');
+  if (after) after(); else route();
+  return true;
+}
+
+const RECS = {
+  use: { label: '✅ Use it', cls: 'ok' },
+  caution: { label: '🟡 Use with caution', cls: 'warn' },
+  replace: { label: '🔁 Look for a better case', cls: 'warn' },
+  skip: { label: '⛔ Don’t rely on it', cls: 'bad' },
+};
+const recBadge = (v) => (v && RECS[v] ? h('span', { class: 'badge ' + RECS[v].cls }, RECS[v].label) : null);
+
+/** Cards for AI-suggested cases, each with "Pull & read". */
+function candidateCards(p, cands, propId) {
+  const wrap = h('div', {});
+  if (!cands?.length) return wrap;
+  wrap.append(h('div', { class: 'section-title' }, 'Suggested cases'),
+    h('p', { class: 'small muted' }, 'AI-suggested from web search. Pull and read each one, and KeyCite it on Westlaw before citing.'));
+  for (const cand of cands) {
+    wrap.append(h('div', { class: 'card', style: 'background:var(--soft)' },
+      h('h3', {}, cand.case_name),
+      h('div', { class: 'small muted' }, [cand.citation, cand.court, cand.year].filter(Boolean).join(' · ')),
+      cand.strength ? h('div', { class: 'row', style: 'margin:6px 0' }, h('span', { class: 'badge ' + (cand.strength === 'strong' ? 'ok' : 'warn') }, cand.strength)) : null,
+      cand.why ? h('p', { class: 'small', style: 'margin:4px 0' }, cand.why) : null,
+      h('div', { class: 'row' },
+        h('button', { class: 'btn slim primary', onclick: async () => {
+          const fresh = await db.get('projects', p.id);
+          const c = await findOrCreateCase(fresh, { case_name: cand.case_name, citation: cand.citation, url: cand.url });
+          if (propId) {
+            const again = await db.get('projects', p.id);
+            const fp = again.props?.find((x) => x.id === propId);
+            if (fp && !fp.caseIds.includes(c.id)) { fp.caseIds.push(c.id); await save('projects', again); }
+          }
+          go(`#/c/${c.id}?${propId ? 'prop=' + propId + '&' : ''}${c.text ? '' : 'pull=1'}`);
+        } }, '📖 Pull & read'),
+        cand.url ? h('a', { class: 'btn slim', href: cand.url, target: '_blank', rel: 'noopener' }, 'Source ↗') : null)));
+  }
+  return wrap;
+}
+
+const WEB_TOOLS = (searches = 8, fetches = 4) => [
+  { type: 'web_search_20250305', name: 'web_search', max_uses: searches },
+  { type: 'web_fetch_20250910', name: 'web_fetch', max_uses: fetches, max_content_tokens: 60000 },
+];
+const CASES_JSON_RULE = `Only suggest cases you actually saw in search results or fetched pages — never from memory alone — and include the URL where you found each. Whenever you recommend specific cases, end your reply with a \`\`\`json block: {"cases":[{"case_name":"","citation":"full reporter citation","court":"","year":"","url":"","why":"one sentence","strength":"strong|moderate|weak"}]}`;
 
 const VERDICTS = {
   strong: { label: '✅ Strong support', cls: 'ok' },
@@ -787,8 +843,8 @@ async function viewProject(pid, tab) {
   if (p.analyzing && Date.now() - (p.updatedAt || 0) > 15 * 60 * 1000) { p.analyzing = false; p.analyzeError = 'The last analysis didn’t finish (the app may have been closed). Try again.'; await save('projects', p); }
   const cases = await projectCases(pid);
   const menu = h('button', { class: 'iconbtn', 'aria-label': 'Project menu', onclick: () => projectMenu(p) }, '⋯');
-  const items = p.quick ? [['cases', 'Cases']] : [['points', 'Points'], ['cases', `Cases (${cases.length})`], ['draft', 'Paragraphs'], ['brief', 'My draft']];
-  if (p.quick) tab = 'cases';
+  const items = p.quick ? [['cases', 'Cases'], ['research', 'Research chat']] : [['points', 'Points'], ['research', 'Research chat'], ['cases', `Cases (${cases.length})`], ['draft', 'Paragraphs'], ['brief', 'My draft']];
+  if (p.quick && tab !== 'research') tab = 'cases';
   const main = h('main', {});
   app.replaceChildren(header(p.name, '#/', p.court || null, menu), tabs(items, tab, (k) => `#/p/${pid}?tab=${k}`), main);
 
@@ -837,9 +893,11 @@ async function viewProject(pid, tab) {
     for (const c of cases.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))) {
       const verdicts = Object.values(c.support || {}).map((s) => s.verdict).filter(Boolean);
       main.append(h('div', { class: 'card tap', onclick: () => go('#/c/' + c.id) },
-        h('h3', {}, caseTitle(c)),
+        h('div', { class: 'row', style: 'flex-wrap:nowrap; align-items:flex-start' },
+          h('h3', { class: 'grow' }, caseTitle(c)),
+          h('button', { class: 'iconbtn', 'aria-label': 'Delete case', style: 'font-size:17px; margin:-6px -8px 0 0', onclick: (e) => { e.stopPropagation(); deleteCase(c); } }, '🗑')),
         h('div', { class: 'small muted' }, [c.citation, c.text ? '📖 ready to read' : 'not pulled yet', c.annotations?.length ? `${c.annotations.length} notes` : null].filter(Boolean).join(' · ')),
-        verdicts.length ? h('div', { class: 'row', style: 'margin-top:6px' }, verdicts.map(verdictBadge)) : null));
+        (verdicts.length || c.rec) ? h('div', { class: 'row', style: 'margin-top:6px' }, recBadge(c.rec?.value), verdicts.map(verdictBadge)) : null));
     }
   }
 
@@ -860,6 +918,8 @@ async function viewProject(pid, tab) {
           h('button', { class: 'btn slim', onclick: () => go(`#/p/${pid}/prop/${prop.id}`) }, 'Open point'))));
     }
   }
+
+  if (tab === 'research') return researchTab(main, p, cases);
 
   if (tab === 'brief') {
     main.append(h('div', { class: 'row', style: 'margin-bottom:12px' },
@@ -1039,6 +1099,94 @@ async function addPropSheet(p) {
   go(`#/p/${p.id}/prop/${prop.id}`);
 }
 
+/* ============================== Research chat (project-wide) ============================== */
+
+function projectOverview(p, cases) {
+  const lines = [];
+  if ((p.props || []).length) {
+    lines.push('THE POINTS IN MY BRIEF (and the cases I have for each):');
+    for (const x of p.props) {
+      const cs = (x.caseIds || []).map((id) => cases.find((c) => c.id === id)).filter(Boolean)
+        .map((c) => `${caseTitle(c)}${c.citation ? ', ' + c.citation : ''}${c.support?.[x.id]?.verdict ? ' [' + c.support[x.id].verdict + ']' : ''}`);
+      lines.push(`- ${x.kind === 'research_needed' ? '[NEEDS RESEARCH] ' : ''}${x.text}${cs.length ? '\n    cases: ' + cs.join('; ') : ''}`);
+    }
+  }
+  const loose = cases.filter((c) => !(p.props || []).some((x) => (x.caseIds || []).includes(c.id)));
+  if (loose.length) lines.push('OTHER CASES IN THIS PROJECT: ' + loose.map((c) => caseTitle(c) + (c.citation ? ', ' + c.citation : '')).join('; '));
+  return lines.join('\n') || 'No points or cases saved yet.';
+}
+
+function researchTab(main, p, cases) {
+  const list = h('div', { class: 'chat' });
+  const draw = () => {
+    list.replaceChildren(...(p.chat || []).map((m) => m.role === 'user'
+      ? h('div', { class: 'msg user' }, m.content)
+      : h('div', { class: 'msg assistant' }, mdEl(m.content), candidateCards(p, m.cases))));
+    if (!p.chat?.length) list.append(h('div', { class: 'muted' },
+      h('p', {}, 'Ask me anything about your case or the law — not just “find a case.” I know your whole draft and every case you’ve saved, and I can search the web for authority.'),
+      h('p', { class: 'small' }, 'Examples: “What’s the standard for a motion to dismiss in Ohio?” · “What will the other side argue against Section II?” · “Is there an Ohio case applying the Dormant Mineral Act to a lessee?”')));
+  };
+  draw();
+  const input = h('textarea', { placeholder: 'Ask a research question…', rows: 1 });
+  input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; });
+  const send = h('button', { class: 'btn primary', 'aria-label': 'Send' }, '↑');
+  const quick = [
+    `What’s the legal standard for this motion in ${p.court || 'my court'}?`,
+    'What will the other side argue, and how do we answer it?',
+    'Which points in my brief are weakest right now?',
+    'Which points still need authority, and what should I search for?',
+  ];
+  const composer = h('div', { class: 'composer' },
+    h('div', { class: 'quick' }, quick.map((q) => h('button', { class: 'chip', onclick: () => ask(q) }, q))),
+    h('div', { class: 'in' }, input, send));
+  const clear = h('button', { class: 'btn slim', style: 'margin-top:14px', onclick: async () => {
+    if (!confirm('Clear this research conversation?')) return;
+    const fresh = await db.get('projects', p.id); fresh.chat = []; await save('projects', fresh); p.chat = []; draw();
+  } }, 'Clear chat');
+  main.style.paddingBottom = '190px';
+  main.append(list, p.chat?.length ? clear : '', composer);
+  send.addEventListener('click', () => ask(input.value));
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !('ontouchstart' in window)) { e.preventDefault(); ask(input.value); } });
+
+  let running = false;
+  async function ask(text) {
+    text = (text || '').trim();
+    if (!text || running) return;
+    running = true;
+    input.value = ''; input.style.height = '';
+    const history = [...(p.chat || []), { role: 'user', content: text }];
+    p.chat = history;
+    draw();
+    const bubble = h('div', { class: 'msg assistant' });
+    const out = h('div', { class: 'md' });
+    bubble.append(out);
+    list.append(bubble);
+    bubble.scrollIntoView({ block: 'end', behavior: 'smooth' });
+    try {
+      const r = await streamInto(out, {
+        system: [...systemFor(p), { type: 'text', text: `You are my legal research partner for this whole project. Answer research questions, explain the law, brainstorm arguments, anticipate the other side's counterarguments, and find authority. Use web search whenever the answer depends on case law, statutes, rules, or current law — especially in ${p.court || 'my jurisdiction'} — and link your sources. Prefer binding authority. Be clear about what you verified in a source versus what is general knowledge.
+
+${CASES_JSON_RULE}
+
+${projectOverview(p, cases)}` }],
+        messages: history.map((m) => ({ role: m.role, content: m.content })),
+        tools: WEB_TOOLS(6, 4),
+        maxTokens: 32000,
+      });
+      const json = lastJSON(r.text);
+      const msg = { role: 'assistant', content: stripJSONBlocks(r.text), cases: json?.cases || [] };
+      const fresh = await db.get('projects', p.id);
+      fresh.chat = [...history, msg];
+      await save('projects', fresh);
+      p.chat = fresh.chat;
+      bubble.append(candidateCards(p, msg.cases));
+    } catch {
+      p.chat = history.slice(0, -1); // drop the unanswered question
+    }
+    running = false;
+  }
+}
+
 /* ============================== Add a case ============================== */
 
 async function addCaseSheet(p, propId) {
@@ -1121,7 +1269,16 @@ async function viewProp(pid, propId) {
     main.append(h('div', { class: 'card tap', onclick: () => go(`#/c/${c.id}?prop=${prop.id}&tab=${c.text ? (sup ? 'read' : 'support') : 'read'}`) },
       h('h3', {}, caseTitle(c)),
       h('div', { class: 'small muted' }, [c.citation, pin ? 'pin ' + pin : null, c.text ? '📖 ready' : 'tap to pull the case'].filter(Boolean).join(' · ')),
-      h('div', { class: 'row', style: 'margin-top:6px' }, sup ? verdictBadge(sup.verdict) : (c.text ? h('span', { class: 'badge' }, 'Support not checked yet') : null))));
+      h('div', { class: 'row', style: 'margin-top:6px' },
+        sup ? verdictBadge(sup.verdict) : (c.text ? h('span', { class: 'badge' }, 'Support not checked yet') : null),
+        c.rec?.propId === prop.id ? recBadge(c.rec.value) : null,
+        h('span', { class: 'grow' }),
+        h('button', { class: 'btn slim', onclick: async (e) => {
+          e.stopPropagation();
+          if (!confirm(`Remove ${caseTitle(c)} from this point? (The case stays in your Cases tab.)`)) return;
+          await persist((fp) => { fp.caseIds = fp.caseIds.filter((x) => x !== c.id); });
+          route();
+        } }, 'Remove'))));
   }
   main.append(h('div', { class: 'btns' },
     h('button', { class: 'btn', onclick: async () => { const c = await addCaseSheet(p, prop.id); if (c) go(`#/c/${c.id}?prop=${prop.id}${c.text ? '' : '&pull=1'}`); } }, '＋ Add a case'),
@@ -1367,7 +1524,7 @@ async function viewCase(cid, tab, propId) {
   if (!c.text) return getCasePanel(main, c, p);
 
   if (tab === 'read') return readTab(main, c, p, prop);
-  if (tab === 'breakdown') return breakdownTab(main, c, p);
+  if (tab === 'breakdown') return breakdownTab(main, c, p, prop);
   if (tab === 'support') return supportTab(main, c, p, prop);
   if (tab === 'chat') return chatTab(main, c, p, prop);
   if (tab === 'notes') return notesTab(main, c, propId);
@@ -1397,20 +1554,14 @@ async function caseMenu(c) {
   const name = h('input', { type: 'text', value: c.name || '' });
   const cite = h('input', { type: 'text', value: c.citation || '' });
   const del = h('button', { class: 'btn danger', style: 'margin-top:16px', onclick: async () => {
-    if (!confirm('Delete this case and its notes?')) return;
-    const p = await db.get('projects', c.projectId);
-    for (const prop of p.props || []) prop.caseIds = (prop.caseIds || []).filter((x) => x !== c.id);
-    await save('projects', p);
-    await db.del('cases', c.id);
-    $('#sheet-root').innerHTML = '';
-    go(`#/p/${p.id}?tab=cases`);
-  } }, '🗑 Delete case');
+    await deleteCase(c, () => { $('#sheet-root').innerHTML = ''; go(`#/p/${c.projectId}?tab=cases`); });
+  } }, '🗑 Delete this case');
   const replace = h('button', { class: 'btn', style: 'margin-top:16px; margin-right:8px', onclick: async () => {
     if (c.annotations?.length && !confirm('Replacing the text removes your highlights on this case. Continue?')) return;
     $('#sheet-root').innerHTML = '';
     c.text = ''; c.fmt = 0; c.annotations = []; c.breakdown = ''; await save('cases', c); route();
   } }, '↻ Replace case text');
-  const ok = await sheet('Case details', h('div', {},
+  const ok = await sheet('Case options', h('div', {},
     h('label', { class: 'f' }, 'Case name'), name, h('label', { class: 'f' }, 'Citation'), cite,
     c.url ? h('p', { class: 'small' }, 'Source: ', h('a', { href: c.url, target: '_blank', rel: 'noopener' }, c.source || c.url)) : (c.source ? h('p', { class: 'small muted' }, 'Source: ' + c.source) : null),
     h('div', {}, replace, del)), [{ label: 'Save', run: () => true }]);
@@ -1829,29 +1980,71 @@ async function explainSnippet(c, prop, snippet, within) {
 
 /* ---- Breakdown ---- */
 
-function breakdownTab(main, c, p) {
+function otherAuthorities(p, c, prop, cases) {
+  if (!prop) return '';
+  const others = (prop.caseIds || []).filter((id) => id !== c.id).map((id) => cases.find((x) => x.id === id)).filter(Boolean);
+  if (!others.length) return 'OUR OTHER AUTHORITIES FOR THIS POINT: none yet.';
+  return 'OUR OTHER AUTHORITIES FOR THIS POINT:\n' + others.map((x) => {
+    const sup = x.support?.[prop.id];
+    return `- ${caseTitle(x)}${x.citation ? ', ' + x.citation : ''}${sup?.verdict ? ` (support check: ${sup.verdict})` : ''}${x.rec?.propId === prop.id ? ` (recommendation: ${x.rec.value})` : ''}`;
+  }).join('\n');
+}
+
+async function breakdownTab(main, c, p, prop) {
+  const cases = await projectCases(p.id);
+  const linkedProps = (p.props || []).filter((x) => (x.caseIds || []).includes(c.id));
   const out = h('div', { class: 'md' });
+  const recRow = h('div', { class: 'row', style: 'margin-bottom:6px' });
   const btn = h('button', { class: 'btn primary big', onclick: run }, c.breakdown ? '↻ Redo breakdown' : '🧠 Break this case down for me');
-  main.append(h('div', { class: 'card' }, c.breakdown ? out : h('p', { class: 'muted', style: 'margin-top:0' }, 'A plain-English walkthrough: the story, the question, the rule, the court’s reasoning step by step, legal terms defined, and a hypothetical.'), c.breakdown ? null : out), btn);
+  const betterBtn = h('button', { class: 'btn big', onclick: findBetter }, c.better ? '🔎 Search again for a better case' : '🔎 Look for a better case');
+  const betterOut = h('div', { class: 'md' });
+  const betterCands = h('div', {});
+  const intro = h('p', { class: 'muted', style: 'margin-top:0' }, 'Starts with whether to use this case — does it support your point, how close are its facts to yours, is there a better case — then the best quotes, then a plain-English walkthrough.');
+  const staleNote = c.breakdown && prop && c.breakdownFor && c.breakdownFor !== prop.id
+    ? h('div', { class: 'banner small' }, 'This breakdown was written for a different point. Tap “Redo breakdown” to judge it against the point pinned above.') : null;
+  main.append(staleNote || '', h('div', { class: 'card' }, recRow, c.breakdown ? out : intro, c.breakdown ? null : out), btn,
+    h('div', { class: 'card', style: 'margin-top:12px' + (c.breakdown ? '' : ';display:none'), id: 'better-card' }, betterBtn, betterOut, betterCands));
   if (c.breakdown) out.innerHTML = md(c.breakdown);
+  if (c.rec) recRow.append(recBadge(c.rec.value));
+  if (c.better) { betterOut.innerHTML = md(c.better.text); betterCands.replaceChildren(candidateCards(p, c.better.cases, prop?.id || c.better.propId)); }
+
+  function pointContext() {
+    if (prop) return `THE POINT I'M USING THIS CASE FOR: ${prop.text}${prop.section ? `\n(Section: ${prop.section})` : ''}\n${otherAuthorities(p, c, prop, cases)}`;
+    if (linkedProps.length) return 'POINTS IN MY BRIEF THIS CASE IS CITED FOR:\n' + linkedProps.map((x) => '- ' + x.text).join('\n');
+    return 'I have not said which point this case is for — judge it against the arguments in my brief (or, if there is no brief, against how it would typically be used).';
+  }
 
   async function run() {
     const done = busy(btn, 'Breaking it down…');
-    if (!out.isConnected) main.firstChild.replaceChildren(out);
+    if (!out.isConnected) main.querySelector('.card').replaceChildren(recRow, out);
+    recRow.replaceChildren();
     try {
       const r = await streamInto(out, {
         system: systemFor(p, c),
-        messages: [{ role: 'user', content: `Break this case down for me using exactly these sections:
+        messages: [{ role: 'user', content: `${pointContext()}
 
+Break this case down for me. Start with exactly one line: "RECOMMENDATION: use", "RECOMMENDATION: caution", "RECOMMENDATION: replace", or "RECOMMENDATION: skip" (use = strong fit, cite it; caution = helps but has gaps the other side could exploit; replace = supports us but a better-fitting case likely exists; skip = doesn't really help us). Then use exactly these sections:
+
+## Should we use this case?
+### 1. Does it support our point?
+(Yes / partly / no — and exactly why, step by step: what the court held → how that gets us to our point, or where the chain breaks.)
+### 2. How close is it to our case?
+(Compare it to OUR facts and posture from my brief. Same type of motion or procedural posture? Same argument? Same industry, type of contract, or kind of parties? Same jurisdiction / binding on ${p.court || 'my court'}? List the similarities, then the differences the other side would use to distinguish it.)
+### 3. Is there a better case?
+(Describe the ideal case for this point — for example, same motion + same argument + same industry — and whether such a case likely exists. If one of our other authorities for this point is stronger, name it and say why.)
+### 4. Recommendation
+(**Helpfulness:** x/5 · **Relevance to our facts:** x/5. Then say plainly: use it, use it with caution (and how to frame it), replace it, or rely on another authority instead.)
+## Best quotes
+(The most useful exact words from the opinion for us, with star pages or ¶ numbers if shown. Say in a few words why each quote helps.)
 ## The bottom line
 (2–3 sentences: who won, and the one rule this case stands for.)
 ## The story (facts)
 (Only the facts that mattered to the decision.)
 ## How it got here (procedural posture)
-(What happened below and what kind of motion/appeal this is — and what standard of review applied, explained simply.)
+(What happened below, what kind of motion/appeal this is, and what standard of review applied, explained simply.)
 ## The question the court had to answer
 ## Legal terms, defined
-(Every term of art used in the opinion that I might not know.)
+(Every term of art in the opinion that I might not know.)
 ## The rule of law
 (The proposition of law this case stands for, in one or two sentences I could put in a brief.)
 ## How the court got there — step by step
@@ -1860,15 +2053,55 @@ function breakdownTab(main, c, p) {
 (Holding and outcome. Note any concurrence or dissent and why it matters.)
 ## A hypothetical to make it click
 ## Watch-outs
-(What's dicta vs. holding; limits on the case; how the other side might distinguish it; whether it's binding in ${p.court || 'my court'}.)
-## Best quotes
-(Exact words from the opinion, with star pages if shown.)` }],
+(Dicta vs. holding; limits on the case; later cases that may have limited it, if mentioned.)` }],
       });
-      c.breakdown = r.text;
+      const rec = (r.text.match(/RECOMMENDATION:\s*(use|caution|replace|skip)/i)?.[1] || '').toLowerCase();
+      c.breakdown = r.text.replace(/^\s*RECOMMENDATION:.*\n?/i, '').trim();
+      c.breakdownFor = prop?.id || '';
+      c.rec = rec ? { value: rec, propId: prop?.id || '' } : null;
       await save('cases', c);
+      out.innerHTML = md(c.breakdown);
+      recRow.replaceChildren(recBadge(rec) || '');
+      document.getElementById('better-card')?.style.removeProperty('display');
+      if (rec === 'replace' || rec === 'skip') toast('Recommendation: look for a better case — tap “Look for a better case” below.', 4500);
     } catch {}
     done();
     btn.textContent = '↻ Redo breakdown';
+  }
+
+  async function findBetter() {
+    const done = busy(betterBtn, 'Searching… (1–2 minutes)');
+    betterCands.replaceChildren();
+    const assessment = (c.breakdown || '').split(/\n## Best quotes/)[0].slice(0, 6000);
+    try {
+      const r = await streamInto(betterOut, {
+        system: systemFor(p),
+        messages: [{ role: 'user', content: `Find a BETTER case than ${caseTitle(c)}${c.citation ? ', ' + c.citation : ''} for my point, if one exists.
+
+${pointContext()}
+JURISDICTION: ${p.court || 'not specified — infer from my brief'}
+
+YOUR EARLIER ASSESSMENT OF ${caseTitle(c)}:
+${assessment || '(none yet)'}
+
+Use web search. Look for cases that match as many of these as possible, in this order of importance: (1) binding in my jurisdiction, (2) same procedural posture / type of motion as mine, (3) same legal argument, (4) same industry or type of contract or parties, (5) similar facts. If no case matches everything, find the ones that match the most, and say which features each one shares with us.
+
+Write for me in plain English:
+1. What you looked for and what you found.
+2. For each case: what it held, how it compares to ${caseTitle(c)} (better or worse, and in what ways), and any quote you saw word-for-word.
+3. Your recommendation: keep ${caseTitle(c)}, add one of these alongside it, or replace it. If nothing better turned up, say so plainly.
+
+${CASES_JSON_RULE}` }],
+        tools: WEB_TOOLS(),
+        maxTokens: 32000,
+      });
+      const json = lastJSON(r.text);
+      c.better = { text: stripJSONBlocks(r.text), cases: json?.cases || [], propId: prop?.id || '', at: Date.now() };
+      await save('cases', c);
+      betterOut.innerHTML = md(c.better.text);
+      betterCands.replaceChildren(candidateCards(p, c.better.cases, prop?.id));
+    } catch {}
+    done();
   }
 }
 
