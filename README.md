@@ -15,7 +15,7 @@ The instructions for how things get explained are built in, and you can edit the
 
 ## Setup (one time)
 
-1. **Turn on GitHub Pages:** in this repo, go to **Settings → Pages**. Under *Build and deployment*, set **Source: Deploy from a branch**, choose the branch that holds this code and the **/(root)** folder, then save. After a minute the app is live at `https://<your-username>.github.io/casereview/`. (On a free GitHub plan, Pages requires the repo to be public. That's safe here: no keys or documents are stored in the repo.)
+1. **Turn on GitHub Pages:** in this repo, go to **Settings → Pages**. Under *Build and deployment*, set **Source: Deploy from a branch**, choose the branch that holds this code and the **/(root)** folder, then save. After a minute the app is live at `https://<your-username>.github.io/CaseReview/`. (On a free GitHub plan, Pages requires the repo to be public. That's safe here: no keys or documents are stored in the repo.)
 2. **Add it to your home screen:** open that link in Safari (iPhone) and tap **Share → Add to Home Screen**. On Android, use Chrome's menu → **Add to Home screen / Install app**.
 3. **Get a Claude API key:** go to [console.anthropic.com](https://console.anthropic.com), add some credit under **Billing** ($10–20 lasts a while), and create a key under **API Keys**. Paste it into the app's **Settings**.
 4. **Optional, free:** create a [CourtListener](https://www.courtlistener.com/sign-in/) account and paste your API token (Profile → Developer Tools) into Settings. With it, the app pulls cases faster and checks that suggested citations are real.
