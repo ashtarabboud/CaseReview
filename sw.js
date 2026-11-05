@@ -1,6 +1,6 @@
 // Network-first service worker: always tries to get the newest version,
 // falls back to the cached copy when offline.
-const CACHE = 'casereview-v6';
+const CACHE = 'casereview-v7';
 const SHELL = [
   './', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-192.png',
@@ -23,7 +23,8 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== self.location.origin) return; // never touch API calls
   e.respondWith(
-    fetch(e.request)
+    // 'no-cache' revalidates with GitHub every time instead of trusting its 10-minute browser cache.
+    fetch(e.request.url, { cache: 'no-cache', credentials: 'same-origin' })
       .then((res) => {
         if (res.ok) {
           const copy = res.clone();
