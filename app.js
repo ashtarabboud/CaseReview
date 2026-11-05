@@ -147,8 +147,17 @@ function friendlyError(e) {
   if (s === 429) return 'Rate limit hit — wait a minute and try again. (Or raise your limits in the Claude Console.)';
   if (s === 529 || s === 503) return 'Claude is overloaded right now. Try again in a moment.';
   if (s === 400 && /credit balance/i.test(e.message)) return 'Your Claude API account is out of credits. Add credits at console.anthropic.com → Billing.';
-  if (e?.name === 'APIConnectionError' || /fetch|network/i.test(e?.message || '')) return 'Network problem — check your connection and try again.';
+  if (isDropped(e)) return 'The connection dropped before Claude finished. Keep the app open on screen while it works (switching apps or locking the phone cuts it off), then try again.';
   return e?.message || String(e);
+}
+
+// Safari reports a dropped connection as "Load failed"; other browsers say "network" / "fetch".
+const isDropped = (e) => !e?.status && !(e instanceof NeedKey) &&
+  (e instanceof TypeError || e?.name === 'APIConnectionError' || /load failed|network|fetch|connection|aborted/i.test(e?.message || ''));
+
+// Keep the phone screen on during long requests (iOS suspends network when the screen locks).
+async function keepAwake() {
+  try { return await navigator.wakeLock?.request('screen'); } catch { return null; }
 }
 
 const upgradeTool = (t) => ({ ...t, type: t.type.replace('web_search_20250305', 'web_search_20260209').replace('web_fetch_20250910', 'web_fetch_20260209') });
@@ -157,7 +166,7 @@ const upgradeTool = (t) => ({ ...t, type: t.type.replace('web_search_20250305', 
  * One call to Claude, streamed. Handles server-tool pauses, refusal fallback,
  * and a couple of compatibility retries. Returns { text, content, message }.
  */
-async function claude({ system, messages, tools, effort, maxTokens = 32000, format, onText }) {
+async function claude({ system, messages, tools, effort, maxTokens = 32000, format, onText, onProgress }) {
   const s = S.get();
   if (!s.apiKey) throw new NeedKey();
   const client = new Anthropic({ apiKey: s.apiKey, dangerouslyAllowBrowser: true, maxRetries: 2 });
@@ -167,11 +176,23 @@ async function claude({ system, messages, tools, effort, maxTokens = 32000, form
     system,
     messages: [...messages],
     output_config: { effort: effort || s.effort, ...(format ? { format } : {}) },
+    // Summarized thinking streams while Claude reasons, so the phone's connection never sits idle.
+    thinking: { type: 'adaptive', display: 'summarized' },
     ...(tools ? { tools } : {}),
   };
+  const lock = await keepAwake();
+  try {
+    return await claudeLoop(client, params, s, { onText, onProgress });
+  } finally {
+    lock?.release?.().catch(() => {});
+  }
+}
+
+async function claudeLoop(client, params, s, { onText, onProgress }) {
   // Server-side fallback: if a safety filter declines, the server reroutes the request.
   let useFallbacks = !s.model.startsWith('claude-haiku');
   let upgraded = false;
+  let drops = 0;
   let text = '';
   const content = [];
   let final;
@@ -181,11 +202,14 @@ async function claude({ system, messages, tools, effort, maxTokens = 32000, form
     const before = text;
     try {
       const stream = client.beta.messages.stream(req);
-      stream.on('text', (t) => { text += t; onText?.(text); });
+      stream.on('text', (t) => { text += t; onText?.(text); onProgress?.('writing', text); });
+      stream.on('thinking', () => onProgress?.('thinking'));
       final = await stream.finalMessage();
     } catch (e) {
       text = before;
       if (e?.status === 400 && useFallbacks && /fallback|beta/i.test(e.message)) { useFallbacks = false; turn--; continue; }
+      if (e?.status === 400 && params.thinking?.display && /display|thinking/i.test(e.message)) { delete params.thinking; turn--; continue; }
+      if (isDropped(e) && drops < 2) { drops++; onProgress?.('retry'); onText?.(text); turn--; continue; }
       if (e?.status === 400 && params.tools && !upgraded && /web_(search|fetch)|tool/i.test(e.message)) {
         upgraded = true; params.tools = params.tools.map(upgradeTool); turn--; continue;
       }
@@ -659,7 +683,7 @@ async function importBackup(e) {
 async function viewProject(pid, tab) {
   const p = await db.get('projects', pid);
   if (!p) return go('#/');
-  if (p.analyzing && Date.now() - (p.updatedAt || 0) > 5 * 60 * 1000) { p.analyzing = false; p.analyzeError = 'The last analysis didn’t finish (the app may have been closed). Try again.'; await save('projects', p); }
+  if (p.analyzing && Date.now() - (p.updatedAt || 0) > 15 * 60 * 1000) { p.analyzing = false; p.analyzeError = 'The last analysis didn’t finish (the app may have been closed). Try again.'; await save('projects', p); }
   const cases = await projectCases(pid);
   const menu = h('button', { class: 'iconbtn', 'aria-label': 'Project menu', onclick: () => projectMenu(p) }, '⋯');
   const items = p.quick ? [['cases', 'Cases']] : [['points', 'Points'], ['cases', `Cases (${cases.length})`], ['draft', 'Paragraphs'], ['brief', 'My draft']];
@@ -670,7 +694,9 @@ async function viewProject(pid, tab) {
   if (tab === 'points') {
     const props = p.props || [];
     if (p.analyzing) {
-      main.append(h('div', { class: 'card' }, h('div', { class: 'thinking' }, h('span', { class: 'spin' }), 'Reading your draft and splitting it into points… (about a minute)')));
+      main.append(h('div', { class: 'card' },
+        h('div', { class: 'thinking' }, h('span', { class: 'spin' }), h('span', { id: 'analyze-status' }, 'Reading your draft and splitting it into points…')),
+        h('p', { class: 'small muted', style: 'margin:6px 0 0' }, 'Keep the app open on screen until this finishes (usually 1–2 minutes).')));
       return;
     }
     if (!props.length) {
@@ -833,6 +859,14 @@ ${p.draft}
 </brief>` }],
       format: { type: 'json_schema', schema: PROPS_SCHEMA },
       maxTokens: 64000,
+      effort: 'low',
+      onProgress: (phase, text) => {
+        const el = document.getElementById('analyze-status');
+        if (!el) return;
+        if (phase === 'retry') el.textContent = 'Connection dropped — retrying…';
+        else if (phase === 'thinking') el.textContent = 'Reading your draft…';
+        else el.textContent = `Found ${(text.match(/"section"/g) || []).length} points so far…`;
+      },
     });
     const data = JSON.parse(r.text);
     const fresh = await db.get('projects', pid);
