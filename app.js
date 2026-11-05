@@ -681,7 +681,10 @@ async function viewProject(pid, tab) {
           : 'Upload your draft motion (with citations and [brackets]) under “My draft”, or add points by hand.'),
         p.draft ? h('button', { class: 'btn primary big', onclick: () => analyzeDraft(p.id) }, '🧭 Go through my draft') : h('button', { class: 'btn primary big', onclick: () => go(`#/p/${pid}?tab=brief`) }, 'Add my draft'),
         h('button', { class: 'btn big', onclick: () => addPropSheet(p) }, '＋ Add a point by hand')));
-      if (p.analyzeError) main.append(h('div', { class: 'err' }, '⚠️ ' + p.analyzeError));
+      // Hide an old "add your key" error once a key has been saved.
+      if (p.analyzeError && !(S.get().apiKey && /API key in Settings/.test(p.analyzeError))) {
+        main.append(h('div', { class: 'err' }, '⚠️ ' + p.analyzeError, ' Tap “Go through my draft” to try again.'));
+      }
       return;
     }
     const research = props.filter((x) => x.kind === 'research_needed').length;
