@@ -6,7 +6,7 @@ import DOMPurify from './vendor/purify.es.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '10';
+const APP_VERSION = '11';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -206,6 +206,8 @@ async function claude({ system, messages, tools, effort, maxTokens = 32000, form
   }
 }
 
+const CONTINUE_MSG = 'Your reply above was cut off by a network glitch. Continue it from exactly where it stops (starting with the next word). Do not repeat anything, and do not add any preamble or mention that you are continuing.';
+
 async function claudeLoop(client, params, s, { onText, onProgress }) {
   // Server-side fallback: if a safety filter declines, the server reroutes the request.
   let useFallbacks = !s.model.startsWith('claude-haiku');
@@ -221,14 +223,17 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
     const req = { ...params };
     if (useFallbacks) { req.betas = ['server-side-fallback-2026-07-01']; req.fallbacks = 'default'; }
     const before = text;
+    const doneBlocks = []; // content blocks that finished arriving in this attempt
+    let curText = '';      // text of the block still arriving
     try {
       const stream = client.beta.messages.stream(req);
+      stream.on('contentBlock', (b) => { doneBlocks.push(b); curText = ''; });
       const t0 = Date.now(); const diag = { t0, first: 0, last: t0, gap: 0, n: 0 };
       stream.on('streamEvent', () => { const now = Date.now(); if (!diag.first) diag.first = now - t0; diag.gap = Math.max(diag.gap, now - diag.last); diag.last = now; diag.n++; });
       req._diag = diag;
       stream.on('text', (t) => {
         if (trimNextLead) { t = t.replace(/^[ \t]+/, ''); if (!t) return; trimNextLead = false; }
-        text += t; onText?.(text); onProgress?.('writing', text);
+        text += t; curText += t; onText?.(text); onProgress?.('writing', text);
       });
       stream.on('thinking', () => onProgress?.('thinking'));
       final = await stream.finalMessage();
@@ -237,6 +242,32 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
       logDiag(req._diag, 'ok ' + final.stop_reason, req);
     } catch (e) {
       logDiag(req._diag, 'ERROR ' + (e?.status || '') + ' ' + (e?.name || '') + ': ' + (e?.message || e), req);
+      // Web research: keep every search / page read / paragraph that finished, and let Claude
+      // carry on from there (the same way the API resumes a paused turn).
+      if (isDropped(e) && params.tools && resumes < 30) {
+        const blocks = doneBlocks.map((b) => (b.type === 'text' ? { type: 'text', text: b.text } : b));
+        while (blocks.length && ['server_tool_use', 'thinking', 'redacted_thinking'].includes(blocks.at(-1).type)) blocks.pop();
+        const keep = curText.slice(0, Math.max(curText.lastIndexOf(' '), curText.lastIndexOf('\n')) + 1);
+        if (keep.trim()) blocks.push({ type: 'text', text: keep.trimEnd() });
+        if (blocks.length) {
+          resumes++; drops = 0;
+          text = text.slice(0, text.length - (curText.length - keep.length));
+          trimNextLead = /[ \t]$/.test(text);
+          content.push(...blocks);
+          onText?.(text);
+          onProgress?.('resume');
+          await sleep(1200);
+          const msgs = [...params.messages];
+          const last = msgs.at(-1);
+          if (last.role === 'assistant') {
+            const prev = typeof last.content === 'string' ? [{ type: 'text', text: last.content }] : last.content;
+            msgs[msgs.length - 1] = { role: 'assistant', content: [...prev, ...blocks] };
+          } else msgs.push({ role: 'assistant', content: blocks });
+          if (blocks.at(-1).type === 'text') msgs.push({ role: 'user', content: CONTINUE_MSG });
+          params.messages = msgs;
+          turn--; continue;
+        }
+      }
       // Phones cut off long connections (~1 min). If Claude had already written part of the
       // answer, ask it to continue from where it stopped instead of starting over.
       if (isDropped(e) && !params.output_config?.format && !params.tools && text.length - before.length > 40 && resumes < 30) {
@@ -250,7 +281,7 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
         onProgress?.('resume');
         params.messages = [...origMessages,
           { role: 'assistant', content: text.trimEnd() },
-          { role: 'user', content: 'Your reply above was cut off by a network glitch. Continue it from exactly where it stops (starting with the next word). Do not repeat anything, and do not add any preamble or mention that you are continuing.' }];
+          { role: 'user', content: CONTINUE_MSG }];
         turn--; continue;
       }
       text = before;
