@@ -6,7 +6,7 @@ import DOMPurify from './vendor/purify.es.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '11';
+const APP_VERSION = '12';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -228,6 +228,11 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
     try {
       const stream = client.beta.messages.stream(req);
       stream.on('contentBlock', (b) => { doneBlocks.push(b); curText = ''; });
+      stream.on('streamEvent', (ev) => {
+        if (ev.type === 'content_block_start' && ev.index > 0 && ev.content_block?.type === 'text' && text && !/\n\s*$/.test(text)) {
+          text += '\n\n';
+        }
+      });
       const t0 = Date.now(); const diag = { t0, first: 0, last: t0, gap: 0, n: 0 };
       stream.on('streamEvent', () => { const now = Date.now(); if (!diag.first) diag.first = now - t0; diag.gap = Math.max(diag.gap, now - diag.last); diag.last = now; diag.n++; });
       req._diag = diag;
@@ -374,8 +379,9 @@ function loadScript(src) {
 }
 
 async function pdfToText(buf) {
+  await import('./vendor/rs-polyfill.mjs');
   const pdfjs = await import('./vendor/pdf.min.mjs');
-  pdfjs.GlobalWorkerOptions.workerSrc = new URL('./vendor/pdf.worker.min.mjs', import.meta.url).href;
+  pdfjs.GlobalWorkerOptions.workerSrc = new URL('./vendor/pdf.worker.shim.mjs', import.meta.url).href;
   const doc = await pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
   let out = '';
   for (let i = 1; i <= doc.numPages; i++) {
