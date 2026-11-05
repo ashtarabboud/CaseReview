@@ -6,7 +6,7 @@ import DOMPurify from './vendor/purify.es.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '8';
+const APP_VERSION = '9';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -161,7 +161,7 @@ function logDiag(d, outcome, req) {
     log.unshift({
       at: new Date(d.t0).toLocaleTimeString(), secs: ((Date.now() - d.t0) / 1000).toFixed(1),
       firstByte: (d.first / 1000).toFixed(1), maxGap: (d.gap / 1000).toFixed(1), events: d.n,
-      size: Math.round(JSON.stringify(req.messages).length / 1000) + 'k', outcome: String(outcome).slice(0, 200),
+      size: Math.round((JSON.stringify(req.messages).length + JSON.stringify(req.system || '').length) / 1000) + 'k', effort: req.output_config?.effort, outcome: String(outcome).slice(0, 200),
     });
     localStorage.setItem('cr.diag', JSON.stringify(log.slice(0, 25)));
   } catch {}
@@ -170,6 +170,8 @@ function logDiag(d, outcome, req) {
 // Safari reports a dropped connection as "Load failed"; other browsers say "network" / "fetch".
 const isDropped = (e) => !e?.status && !(e instanceof NeedKey) &&
   (e instanceof TypeError || e?.name === 'APIConnectionError' || /load failed|network|fetch|connection|aborted|stream ended|ended without/i.test(e?.message || ''));
+
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 // Keep the phone screen on during long requests (iOS suspends network when the screen locks).
 async function keepAwake() {
@@ -237,8 +239,10 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
       logDiag(req._diag, 'ERROR ' + (e?.status || '') + ' ' + (e?.name || '') + ': ' + (e?.message || e), req);
       // Phones cut off long connections (~1 min). If Claude had already written part of the
       // answer, ask it to continue from where it stopped instead of starting over.
-      if (isDropped(e) && !params.output_config?.format && !params.tools && text.length - before.length > 40 && resumes < 10) {
+      if (isDropped(e) && !params.output_config?.format && !params.tools && text.length - before.length > 40 && resumes < 30) {
         resumes++;
+        drops = 0;
+        await sleep(1200); // give the phone a moment to open a fresh connection
         const cut = Math.max(text.lastIndexOf(' '), text.lastIndexOf('\n')) + 1; // drop only the half-written last word
         text = text.slice(0, Math.max(cut, before.length));
         trimNextLead = /[ \t]$/.test(text);
@@ -252,7 +256,11 @@ async function claudeLoop(client, params, s, { onText, onProgress }) {
       text = before;
       if (e?.status === 400 && useFallbacks && /fallback|beta/i.test(e.message)) { useFallbacks = false; turn--; continue; }
       if (e?.status === 400 && params.thinking?.display && /display|thinking/i.test(e.message)) { delete params.thinking; turn--; continue; }
-      if (isDropped(e) && drops < 2) { drops++; onProgress?.('retry'); onText?.(text); turn--; continue; }
+      if (isDropped(e) && drops < 5) {
+        drops++; onProgress?.('retry'); onText?.(text);
+        await sleep(1000 * 2 ** (drops - 1)); // 1s, 2s, 4s, 8s, 16s
+        turn--; continue;
+      }
       if (e?.status === 400 && params.tools && !upgraded && /web_(search|fetch)|tool/i.test(e.message)) {
         upgraded = true; params.tools = params.tools.map(upgradeTool); turn--; continue;
       }
@@ -712,7 +720,7 @@ function diagCard() {
   const draw = () => {
     const log = JSON.parse(localStorage.getItem('cr.diag') || '[]');
     list.textContent = log.length
-      ? log.map((d) => `${d.at} · ${d.secs}s · 1st ${d.firstByte}s · gap ${d.maxGap}s · ${d.events} ev · ${d.size}\n  ${d.outcome}`).join('\n')
+      ? log.map((d) => `${d.at} · ${d.secs}s · 1st ${d.firstByte}s · gap ${d.maxGap}s · ${d.events} ev · ${d.size}${d.effort ? ' · ' + d.effort : ''}\n  ${d.outcome}`).join('\n')
       : 'No requests logged yet.';
   };
   draw();
@@ -727,10 +735,29 @@ function diagCard() {
       toast('✓ Long request finished fine');
     } catch (e) { toast('⚠️ ' + friendlyError(e), 5000); }
     done(); draw();
-  } }, '📶 Run a long connection test');
+  } }, '📶 Long answer test');
+  const test = (label, opts) => {
+    const b = h('button', { class: 'btn', onclick: async () => {
+      const done = busy(b, 'Testing…');
+      try { await claude(opts); toast('✓ ' + label + ' finished fine'); } catch (e) { toast('⚠️ ' + friendlyError(e), 5000); }
+      done(); draw();
+    } }, label);
+    return b;
+  };
+  const filler = 'The court considered the parties’ arguments regarding standing, abandonment, and the statutory notice requirements under the Dormant Mineral Act. '.repeat(1200);
+  const bigBtn = test('📦 Big upload test', {
+    system: [{ type: 'text', text: 'Test. Here is a long document:\n' + filler }],
+    messages: [{ role: 'user', content: 'Connection test: write a numbered list of 40 short plain-English sentences about motions to dismiss.' }],
+    effort: 'low', maxTokens: 8000,
+  });
+  const thinkBtn = test('🧠 Thinking test', {
+    system: 'You are a careful legal tutor.',
+    messages: [{ role: 'user', content: 'Connection test. Think carefully, then explain step by step, with a hypothetical, how a court decides whether a plaintiff has standing, and how that differs from failure to state a claim. About 600 words.' }],
+    effort: 'medium', maxTokens: 16000,
+  });
   return h('div', { class: 'card' },
-    h('p', { class: 'small muted', style: 'margin-top:0' }, 'If things keep failing, run this test, then screenshot the log below and send it to whoever is helping you. (Costs about 5 cents.)'),
-    h('div', { class: 'row' }, btn, h('button', { class: 'btn slim', onclick: draw }, 'Refresh log')),
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'If things keep failing, run each test below (one at a time, keep the app open), then screenshot the log. Together they cost about 30 cents.'),
+    h('div', { class: 'stack' }, btn, bigBtn, thinkBtn, h('button', { class: 'btn slim', onclick: () => { localStorage.removeItem('cr.diag'); draw(); } }, 'Clear log')),
     h('div', { class: 'small muted', style: 'margin-top:8px' }, 'App mode: ' + (matchMedia('(display-mode: standalone)').matches || navigator.standalone ? 'Home Screen app' : 'Browser tab')),
     list);
 }
