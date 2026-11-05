@@ -268,3 +268,9 @@ body[data-reading="night"] .readbar .muted { color: #8d887d; }
 .pickprop.on { border-color: var(--brand); border-width: 2px; }
 .reader p.fn { font-size: .78em; line-height: 1.55; color: var(--rmuted); border-top: 1px solid var(--rsoft); padding-top: .6em; }
 body[data-reading="night"] .propbar { background: #2a2416; border-color: #4a3d20; }
+.lineup { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line); }
+.connrow { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: var(--card); border-radius: 12px; padding: 8px; }
+.connrow.on { border-color: var(--brand); }
+.conncheck { flex: 1; display: flex; align-items: center; gap: 10px; border: 0; background: none; font-size: 15px; cursor: pointer; text-align: left; padding: 2px; }
+.conncheck .box { flex: 0 0 24px; height: 24px; border-radius: 7px; border: 2px solid var(--line); display: grid; place-items: center; font-weight: 700; color: var(--brand-ink); }
+.connrow.on .box { background: var(--brand); border-color: var(--brand); }

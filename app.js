@@ -6,7 +6,7 @@ import DOMPurify from './vendor/purify.es.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '12';
+const APP_VERSION = '13';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -594,13 +594,31 @@ const RECS = {
 };
 const recBadge = (v) => (v && RECS[v] ? h('span', { class: 'badge ' + RECS[v].cls }, RECS[v].label) : null);
 
-/** Cards for AI-suggested cases, each with "Pull & read". */
-function candidateCards(p, cands, propId) {
+/** Cards for suggested cases: "Pull & read" opens it now, "Add to point" saves it for later. */
+function candidateCards(p, cands, propId, { unverified = false, title = 'Suggested cases' } = {}) {
   const wrap = h('div', {});
   if (!cands?.length) return wrap;
-  wrap.append(h('div', { class: 'section-title' }, 'Suggested cases'),
-    h('p', { class: 'small muted' }, 'AI-suggested from web search. Pull and read each one, and KeyCite it on Westlaw before citing.'));
+  wrap.append(h('div', { class: 'section-title' }, title),
+    h('p', { class: 'small muted' }, unverified
+      ? 'Mentioned from Claude’s own knowledge, not a web search — pulling a case checks that it really exists. KeyCite before citing.'
+      : 'AI-suggested from web search. Pull and read each one, and KeyCite it on Westlaw before citing.'));
+  const saveCand = async (cand) => {
+    const fresh = await db.get('projects', p.id);
+    const c = await findOrCreateCase(fresh, { case_name: cand.case_name, citation: cand.citation, url: cand.url });
+    if (propId) {
+      const again = await db.get('projects', p.id);
+      const fp = again.props?.find((x) => x.id === propId);
+      if (fp && !fp.caseIds.includes(c.id)) { fp.caseIds.push(c.id); await save('projects', again); }
+    }
+    return c;
+  };
   for (const cand of cands) {
+    const addBtn = h('button', { class: 'btn slim', onclick: async () => {
+      await saveCand(cand);
+      addBtn.textContent = propId ? '✓ Added to point' : '✓ Saved to Cases';
+      addBtn.disabled = true;
+      toast(propId ? 'Added to this point — pull it from the point whenever you’re ready' : 'Saved to your Cases tab');
+    } }, propId ? '＋ Add to point' : '＋ Save to Cases');
     wrap.append(h('div', { class: 'card', style: 'background:var(--soft)' },
       h('h3', {}, cand.case_name),
       h('div', { class: 'small muted' }, [cand.citation, cand.court, cand.year].filter(Boolean).join(' · ')),
@@ -608,19 +626,16 @@ function candidateCards(p, cands, propId) {
       cand.why ? h('p', { class: 'small', style: 'margin:4px 0' }, cand.why) : null,
       h('div', { class: 'row' },
         h('button', { class: 'btn slim primary', onclick: async () => {
-          const fresh = await db.get('projects', p.id);
-          const c = await findOrCreateCase(fresh, { case_name: cand.case_name, citation: cand.citation, url: cand.url });
-          if (propId) {
-            const again = await db.get('projects', p.id);
-            const fp = again.props?.find((x) => x.id === propId);
-            if (fp && !fp.caseIds.includes(c.id)) { fp.caseIds.push(c.id); await save('projects', again); }
-          }
+          const c = await saveCand(cand);
           go(`#/c/${c.id}?${propId ? 'prop=' + propId + '&' : ''}${c.text ? '' : 'pull=1'}`);
         } }, '📖 Pull & read'),
+        addBtn,
         cand.url ? h('a', { class: 'btn slim', href: cand.url, target: '_blank', rel: 'noopener' }, 'Source ↗') : null)));
   }
   return wrap;
 }
+
+const MENTIONED_RULE = 'If you name any OTHER case in your answer (for example, a case that might be better), end your reply with a ```json block listing them: {"cases":[{"case_name":"","citation":"","why":"one sentence"}]}. Only list cases you are confident really exist; leave the citation blank if you are not sure of it.';
 
 const WEB_TOOLS = (searches = 8, fetches = 4) => [
   { type: 'web_search_20250305', name: 'web_search', max_uses: searches },
@@ -1552,7 +1567,7 @@ async function viewCase(cid, tab, propId) {
   const qs = (t) => `#/c/${cid}?tab=${t}${propId ? '&prop=' + propId : ''}`;
   const menu = h('button', { class: 'iconbtn', 'aria-label': 'Case menu', onclick: () => caseMenu(c) }, '⋯');
   const main = h('main', {});
-  const items = [['read', 'Read'], ['breakdown', 'Break it down'], ...(p.quick ? [] : [['support', 'Support?']]), ['chat', 'Ask'], ['notes', `Notes (${c.annotations?.length || 0})`]];
+  const items = [['read', 'Read'], ['breakdown', 'Break it down'], ...(p.quick ? [] : [['compare', 'Compare'], ['support', 'Support?']]), ['chat', 'Ask'], ['notes', `Notes (${c.annotations?.length || 0})`]];
   const hdr = header(caseTitle(c), back, [c.citation, c.court, c.year].filter(Boolean).join(' · ') || null, menu);
   hdr.classList.add('compact');
   if (!p.quick && p.props?.length) hdr.append(propBar(p, c, prop, tab));
@@ -1563,27 +1578,52 @@ async function viewCase(cid, tab, propId) {
   if (tab === 'read') return readTab(main, c, p, prop);
   if (tab === 'breakdown') return breakdownTab(main, c, p, prop);
   if (tab === 'support') return supportTab(main, c, p, prop);
+  if (tab === 'compare') return compareTab(main, c, p, prop);
   if (tab === 'chat') return chatTab(main, c, p, prop);
   if (tab === 'notes') return notesTab(main, c, propId);
 }
 
+/** Choose which points this case is used for (any number), and which one to pin. */
+async function connectSheet(p, c, prop, tab) {
+  const fresh = await db.get('projects', p.id);
+  const props = fresh.props || [];
+  const chosen = new Set(props.filter((x) => (x.caseIds || []).includes(c.id)).map((x) => x.id));
+  let pin = prop?.id || null;
+  const rows = h('div', { class: 'stack' });
+  const draw = () => rows.replaceChildren(...props.map((x) => h('div', { class: 'connrow' + (chosen.has(x.id) ? ' on' : '') },
+    h('button', { class: 'conncheck', 'aria-pressed': chosen.has(x.id), onclick: () => { chosen.has(x.id) ? chosen.delete(x.id) : chosen.add(x.id); if (!chosen.has(x.id) && pin === x.id) pin = null; draw(); } },
+      h('span', { class: 'box' }, chosen.has(x.id) ? '✓' : ''),
+      h('span', { class: 'grow', style: 'text-align:left' }, x.section ? h('span', { class: 'small muted', style: 'display:block' }, x.section) : null, x.text)),
+    h('button', { class: 'btn slim' + (pin === x.id ? ' primary' : ''), onclick: () => { pin = x.id; chosen.add(x.id); draw(); } }, pin === x.id ? '📌 Pinned' : 'Pin'))));
+  draw();
+  const ok = await sheet('Connect this case to points', h('div', {},
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'Check every point this case is used for. “Pin” shows that point at the top while you read, and the Compare tab uses its cases.'),
+    rows), [{ label: 'Save', run: () => true }]);
+  if (!ok) return;
+  const again = await db.get('projects', p.id);
+  for (const x of again.props || []) {
+    const has = (x.caseIds || []).includes(c.id);
+    if (chosen.has(x.id) && !has) x.caseIds = [...(x.caseIds || []), c.id];
+    if (!chosen.has(x.id) && has) x.caseIds = x.caseIds.filter((id) => id !== c.id);
+  }
+  await save('projects', again);
+  toast(`Connected to ${chosen.size} point${chosen.size === 1 ? '' : 's'}`);
+  const nextPin = pin && chosen.has(pin) ? pin : [...chosen][0];
+  location.hash = `#/c/${c.id}?tab=${tab}${nextPin ? '&prop=' + nextPin : ''}`;
+  route();
+}
+
 /** Pinned bar under the case title showing the point you're researching. */
 function propBar(p, c, prop, tab) {
-  const pick = async () => {
-    const list = h('div', { class: 'stack' }, (p.props || []).map((x) => h('button', {
-      class: 'pickprop' + (prop && x.id === prop.id ? ' on' : ''),
-      onclick: () => { $('#sheet-root').innerHTML = ''; go(`#/c/${c.id}?tab=${tab}&prop=${x.id}`); },
-    }, x.section ? h('div', { class: 'small muted' }, x.section) : null, x.text)));
-    await sheet('Which point are you researching?', list, []);
-  };
-  if (!prop) return h('div', { class: 'propbar' }, h('button', { class: 'pchoose', onclick: pick }, '＋ Pin the point you’re researching'));
+  const open = () => connectSheet(p, c, prop, tab);
+  if (!prop) return h('div', { class: 'propbar' }, h('button', { class: 'pchoose', onclick: open }, '🔗 Connect this case to a point'));
   const sup = c.support?.[prop.id];
   const text = h('div', { class: 'ptext clamp', onclick: () => text.classList.toggle('clamp') }, prop.text);
   return h('div', { class: 'propbar' },
     h('div', { class: 'phead' },
       h('span', { class: 'plabel' }, 'Your point'),
       sup ? verdictBadge(sup.verdict) : null,
-      h('button', { class: 'pswitch', onclick: pick }, 'Change')),
+      h('button', { class: 'pswitch', onclick: open }, 'Change')),
     text);
 }
 
@@ -1598,10 +1638,12 @@ async function caseMenu(c) {
     $('#sheet-root').innerHTML = '';
     c.text = ''; c.fmt = 0; c.annotations = []; c.breakdown = ''; await save('cases', c); route();
   } }, '↻ Replace case text');
+  const p0 = await db.get('projects', c.projectId);
+  const conn = !p0?.quick && p0?.props?.length ? h('button', { class: 'btn', style: 'margin-top:16px; margin-right:8px', onclick: () => { $('#sheet-root').innerHTML = ''; const q = new URLSearchParams(location.hash.split('?')[1]); const pr = p0.props.find((x) => x.id === q.get('prop')); connectSheet(p0, c, pr, q.get('tab') || 'read'); } }, '🔗 Connect to points') : null;
   const ok = await sheet('Case options', h('div', {},
     h('label', { class: 'f' }, 'Case name'), name, h('label', { class: 'f' }, 'Citation'), cite,
     c.url ? h('p', { class: 'small' }, 'Source: ', h('a', { href: c.url, target: '_blank', rel: 'noopener' }, c.source || c.url)) : (c.source ? h('p', { class: 'small muted' }, 'Source: ' + c.source) : null),
-    h('div', {}, replace, del)), [{ label: 'Save', run: () => true }]);
+    h('div', {}, conn, replace, del)), [{ label: 'Save', run: () => true }]);
   if (ok) { c.name = name.value.trim(); c.citation = cite.value.trim(); await save('cases', c); route(); }
 }
 
@@ -2039,7 +2081,8 @@ async function breakdownTab(main, c, p, prop) {
   const intro = h('p', { class: 'muted', style: 'margin-top:0' }, 'Starts with whether to use this case — does it support your point, how close are its facts to yours, is there a better case — then the best quotes, then a plain-English walkthrough.');
   const staleNote = c.breakdown && prop && c.breakdownFor && c.breakdownFor !== prop.id
     ? h('div', { class: 'banner small' }, 'This breakdown was written for a different point. Tap “Redo breakdown” to judge it against the point pinned above.') : null;
-  main.append(staleNote || '', h('div', { class: 'card' }, recRow, c.breakdown ? out : intro, c.breakdown ? null : out), btn,
+  const mentionedEl = h('div', {}, candidateCards(p, c.mentioned, prop?.id, { unverified: true, title: 'Cases mentioned' }));
+  main.append(staleNote || '', h('div', { class: 'card' }, recRow, c.breakdown ? out : intro, c.breakdown ? null : out, mentionedEl), btn,
     h('div', { class: 'card', style: 'margin-top:12px' + (c.breakdown ? '' : ';display:none'), id: 'better-card' }, betterBtn, betterOut, betterCands));
   if (c.breakdown) out.innerHTML = md(c.breakdown);
   if (c.rec) recRow.append(recBadge(c.rec.value));
@@ -2053,7 +2096,8 @@ async function breakdownTab(main, c, p, prop) {
 
   async function run() {
     const done = busy(btn, 'Breaking it down…');
-    if (!out.isConnected) main.querySelector('.card').replaceChildren(recRow, out);
+    if (!out.isConnected) main.querySelector('.card').replaceChildren(recRow, out, mentionedEl);
+    mentionedEl.replaceChildren();
     recRow.replaceChildren();
     try {
       const r = await streamInto(out, {
@@ -2090,10 +2134,14 @@ Break this case down for me. Start with exactly one line: "RECOMMENDATION: use",
 (Holding and outcome. Note any concurrence or dissent and why it matters.)
 ## A hypothetical to make it click
 ## Watch-outs
-(Dicta vs. holding; limits on the case; later cases that may have limited it, if mentioned.)` }],
+(Dicta vs. holding; limits on the case; later cases that may have limited it, if mentioned.)
+
+${MENTIONED_RULE}` }],
       });
       const rec = (r.text.match(/RECOMMENDATION:\s*(use|caution|replace|skip)/i)?.[1] || '').toLowerCase();
-      c.breakdown = r.text.replace(/^\s*RECOMMENDATION:.*\n?/i, '').trim();
+      c.mentioned = lastJSON(r.text)?.cases || [];
+      c.breakdown = stripJSONBlocks(r.text.replace(/^\s*RECOMMENDATION:.*\n?/i, '')).trim();
+      mentionedEl.replaceChildren(candidateCards(p, c.mentioned, prop?.id, { unverified: true, title: 'Cases mentioned' }));
       c.breakdownFor = prop?.id || '';
       c.rec = rec ? { value: rec, propId: prop?.id || '' } : null;
       await save('cases', c);
@@ -2210,6 +2258,196 @@ function supportTab(main, c, p, prop) {
   show();
 }
 
+/* ---- Compare: this case alongside the other cases for the same point ---- */
+
+function otherCasesBlock(c, prop, cases) {
+  const others = (prop.caseIds || []).filter((id) => id !== c.id).map((id) => cases.find((x) => x.id === id)).filter(Boolean);
+  if (!others.length) return { others, block: null };
+  const text = 'MY OTHER CASES FOR THIS POINT (full text where I have pulled it):\n\n' + others.map((x) => {
+    const sup = x.support?.[prop.id];
+    const head = `### ${caseTitle(x)}${x.citation ? ', ' + x.citation : ''}${sup?.verdict ? ` — my support check: ${sup.verdict}` : ''}${x.rec?.propId === prop.id ? ` — recommendation: ${x.rec.value}` : ''}`;
+    return x.text ? `${head}\n<opinion>\n${x.text}\n</opinion>` : `${head}\n(Not pulled yet — I only have its name and citation.)`;
+  }).join('\n\n');
+  return { others, block: { type: 'text', text, cache_control: { type: 'ephemeral' } } };
+}
+
+/** A reusable chat with streaming answers and case cards. */
+function chatBox({ main, history, persist, request, quick = [], placeholder, empty, p, propId, unverified = false }) {
+  const list = h('div', { class: 'chat' });
+  const draw = () => {
+    list.replaceChildren(...history.map((m) => m.role === 'user'
+      ? h('div', { class: 'msg user' }, m.display || m.content)
+      : h('div', { class: 'msg assistant' }, mdEl(m.content), candidateCards(p, m.cases, propId, { unverified }))));
+    if (!history.length && empty) list.append(h('p', { class: 'muted' }, empty));
+  };
+  draw();
+  const input = h('textarea', { placeholder, rows: 1 });
+  input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; });
+  const send = h('button', { class: 'btn primary', 'aria-label': 'Send' }, '↑');
+  main.style.paddingBottom = '190px';
+  main.append(list, h('div', { class: 'composer' },
+    quick.length ? h('div', { class: 'quick' }, quick.map((q) => h('button', { class: 'chip', onclick: () => ask(q) }, q))) : null,
+    h('div', { class: 'in' }, input, send)));
+  send.addEventListener('click', () => ask(input.value));
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !('ontouchstart' in window)) { e.preventDefault(); ask(input.value); } });
+  let running = false;
+  async function ask(text) {
+    text = (text || '').trim();
+    if (!text || running) return;
+    running = true;
+    input.value = ''; input.style.height = '';
+    history.push({ role: 'user', content: text });
+    draw();
+    const bubble = h('div', { class: 'msg assistant' });
+    const out = h('div', { class: 'md' });
+    bubble.append(out);
+    list.querySelector(':scope > p.muted')?.remove();
+    list.append(bubble);
+    bubble.scrollIntoView({ block: 'end', behavior: 'smooth' });
+    try {
+      const r = await streamInto(out, { ...request(), messages: history.map((m) => ({ role: m.role, content: m.content })) });
+      const json = lastJSON(r.text);
+      const msg = { role: 'assistant', content: stripJSONBlocks(r.text), cases: json?.cases || [] };
+      history.push(msg);
+      out.innerHTML = md(msg.content);
+      bubble.append(candidateCards(p, msg.cases, propId, { unverified }));
+      await persist(history);
+    } catch {
+      history.pop();
+    }
+    running = false;
+  }
+  return { ask };
+}
+
+async function compareTab(main, c, p, prop) {
+  if (!prop) {
+    main.append(h('div', { class: 'card stack' },
+      h('h3', {}, 'Compare this case with your other cases'),
+      h('p', { class: 'muted', style: 'margin:0' }, 'First connect this case to a point. Then I’ll read it alongside every other case you have for that point and show how they fit together.'),
+      h('button', { class: 'btn primary big', onclick: () => connectSheet(p, c, null, 'compare') }, '🔗 Connect to a point')));
+    return;
+  }
+  const cases = await projectCases(p.id);
+  const { others, block } = otherCasesBlock(c, prop, cases);
+  const system = () => [...systemFor(p, c), ...(block ? [block] : [])];
+
+  // The line-up
+  const lineup = h('div', { class: 'card' },
+    h('div', { class: 'row small', style: 'margin-bottom:6px' }, h('strong', {}, `${others.length + 1} case${others.length ? 's' : ''} for this point`)),
+    [c, ...others].map((x) => {
+      const sup = x.support?.[prop.id];
+      return h('div', { class: 'lineup' },
+        h('div', { class: 'grow' },
+          h('div', {}, caseTitle(x), x.id === c.id ? h('span', { class: 'badge', style: 'margin-left:6px' }, 'reading now') : null),
+          h('div', { class: 'small muted' }, [x.citation, x.text ? null : 'not pulled yet'].filter(Boolean).join(' · '))),
+        sup ? verdictBadge(sup.verdict) : null,
+        x.id === c.id ? null : h('button', { class: 'btn slim', onclick: () => go(`#/c/${x.id}?prop=${prop.id}&tab=${x.text ? 'compare' : 'read&pull=1'}`) }, x.text ? 'Open' : 'Pull'));
+    }));
+  main.append(h('div', { class: 'section-title' }, 'The line-up'), lineup);
+  if (others.some((x) => !x.text)) main.append(h('p', { class: 'small muted' }, 'Cases that aren’t pulled yet are compared by name only — pull them for a real comparison.'));
+
+  // Comparison
+  c.compare ||= {}; c.compareResearch ||= {}; c.compareChat ||= {};
+  const cmpOut = h('div', { class: 'md' });
+  const cmpCards = h('div', {});
+  const cmpBtn = h('button', { class: 'btn primary big', onclick: runCompare }, c.compare[prop.id] ? '↻ Redo comparison' : (others.length ? '🧩 Compare with my other cases' : '🧩 How does this case fit? (no other cases yet)'));
+  const gapOut = h('div', { class: 'md' });
+  const gapCards = h('div', {});
+  const gapBtn = h('button', { class: 'btn big', onclick: runGaps }, c.compareResearch[prop.id] ? '🔎 Search again to fill the gaps' : '🔎 Research to fill the gaps');
+  main.append(h('div', { class: 'section-title' }, 'How they fit together'), h('div', { class: 'card' }, cmpBtn, cmpOut, cmpCards),
+    h('div', { class: 'card' }, gapBtn, gapOut, gapCards));
+  if (c.compare[prop.id]) { cmpOut.innerHTML = md(c.compare[prop.id].text); cmpCards.replaceChildren(candidateCards(p, c.compare[prop.id].cases, prop.id, { unverified: true, title: 'Cases mentioned' })); }
+  if (c.compareResearch[prop.id]) { gapOut.innerHTML = md(c.compareResearch[prop.id].text); gapCards.replaceChildren(candidateCards(p, c.compareResearch[prop.id].cases, prop.id)); }
+
+  async function persistCase(mut) {
+    const fresh = await db.get('cases', c.id);
+    fresh.compare ||= {}; fresh.compareResearch ||= {}; fresh.compareChat ||= {};
+    mut(fresh);
+    await save('cases', fresh);
+    Object.assign(c, { compare: fresh.compare, compareResearch: fresh.compareResearch, compareChat: fresh.compareChat });
+  }
+
+  async function runCompare() {
+    const done = busy(cmpBtn, 'Reading all the cases…');
+    cmpCards.replaceChildren();
+    try {
+      const r = await streamInto(cmpOut, {
+        system: system(),
+        messages: [{ role: 'user', content: `MY POINT: ${prop.text}
+
+Compare THE CASE WE ARE READING (${caseTitle(c)}) with my other cases for this point${others.length ? '' : ' (I have none yet, so assess how this case would anchor the point on its own)'}. Judge everything against my facts and posture from my brief. Use these sections:
+
+## How they fit together
+(A short overview: together, how well do these cases prove my point?)
+## Side by side
+(A table: Case | What it holds (one line) | How close to our facts | Binding on ${p.court || 'my court'}? | Strength for our point (x/5))
+## What each case adds
+(A short paragraph per case: the role it plays — sets out the rule, applies it to facts like ours, binding authority, same industry or same motion, etc.)
+## Overlap and weak links
+(Redundant cases, cases the other side can easily distinguish, anything that cuts against us.)
+## Gaps
+(What's still missing — e.g., a binding case, a case with our motion / argument / industry — and what kind of case would fill each gap.)
+## Recommended line-up
+(Which cases to cite, in what order, and which to drop.)
+
+${MENTIONED_RULE}` }],
+      });
+      const json = lastJSON(r.text);
+      const entry = { text: stripJSONBlocks(r.text), cases: json?.cases || [], at: Date.now() };
+      await persistCase((f) => { f.compare[prop.id] = entry; });
+      cmpOut.innerHTML = md(entry.text);
+      cmpCards.replaceChildren(candidateCards(p, entry.cases, prop.id, { unverified: true, title: 'Cases mentioned' }));
+    } catch {}
+    done();
+    cmpBtn.textContent = '↻ Redo comparison';
+  }
+
+  async function runGaps() {
+    const done = busy(gapBtn, 'Searching… (1–2 minutes)');
+    gapCards.replaceChildren();
+    const cmp = c.compare[prop.id]?.text || '';
+    try {
+      const r = await streamInto(gapOut, {
+        system: system(),
+        messages: [{ role: 'user', content: `MY POINT: ${prop.text}
+JURISDICTION: ${p.court || 'infer from my brief'}
+${cmp ? 'YOUR COMPARISON OF MY CURRENT CASES:\n' + cmp.slice(0, 8000) : 'You can see this case and my other cases for the point above.'}
+
+Search the web for cases that fill the gaps in my line-up for this point. Prioritize, in order: binding authority in my jurisdiction; the same motion or procedural posture as mine; the same argument; the same industry, type of contract, or kind of parties; similar facts. Skip cases I already have.
+
+For each case you find: what it held, which gap it fills, and how it compares to the cases I already have. Then say whether it should be added to my line-up or replace one of my cases.
+
+${CASES_JSON_RULE}` }],
+        tools: WEB_TOOLS(),
+        maxTokens: 32000,
+      });
+      const json = lastJSON(r.text);
+      const entry = { text: stripJSONBlocks(r.text), cases: json?.cases || [], at: Date.now() };
+      await persistCase((f) => { f.compareResearch[prop.id] = entry; });
+      gapOut.innerHTML = md(entry.text);
+      gapCards.replaceChildren(candidateCards(p, entry.cases, prop.id));
+    } catch {}
+    done();
+  }
+
+  // Chat across all the cases for this point (can also search the web)
+  main.append(h('div', { class: 'section-title' }, 'Ask about these cases together'));
+  const history = c.compareChat[prop.id] ? [...c.compareChat[prop.id]] : [];
+  chatBox({
+    main, history, p, propId: prop.id,
+    placeholder: 'Ask about how these cases fit…',
+    empty: 'I can see this case, every other case you’ve connected to this point, and your draft. I can also search the web for new cases.',
+    quick: ['Which of my cases is strongest for this point, and why?', 'Do any of my cases conflict with each other?', 'Which case is closest to our facts?', 'Find a case with our same motion and industry.'],
+    persist: (hist) => persistCase((f) => { f.compareChat[prop.id] = hist; }),
+    request: () => ({
+      system: [...system(), { type: 'text', text: `You can see the case we are reading, all my other cases for the point "${prop.text}", and my draft brief. Answer questions about how these cases fit together. Use web search when I ask you to find new cases or check current law.\n\n${CASES_JSON_RULE}` }],
+      tools: WEB_TOOLS(5, 3),
+      maxTokens: 32000,
+    }),
+  });
+}
+
 /* ---- Chat ---- */
 
 function chatTab(main, c, p, prop) {
@@ -2217,7 +2455,7 @@ function chatTab(main, c, p, prop) {
   const draw = () => {
     list.replaceChildren(...(c.chat || []).map((m) => m.role === 'user'
       ? h('div', { class: 'msg user' }, m.display || m.content)
-      : h('div', { class: 'msg assistant md', html: md(m.content) })));
+      : h('div', { class: 'msg assistant' }, mdEl(m.content), candidateCards(p, m.cases, prop?.id, { unverified: true, title: 'Cases mentioned' }))));
     if (!c.chat?.length) list.append(h('p', { class: 'muted' }, 'Ask anything about this case. I’ve read the whole opinion and your draft brief.'));
   };
   draw();
@@ -2255,8 +2493,11 @@ function chatTab(main, c, p, prop) {
     list.append(out);
     out.scrollIntoView({ block: 'end', behavior: 'smooth' });
     try {
-      const r = await streamInto(out, { system: systemFor(p, c), messages: c.chat.map((m) => ({ role: m.role, content: m.content })) });
-      c.chat.push({ role: 'assistant', content: r.text });
+      const r = await streamInto(out, { system: [...systemFor(p, c), { type: 'text', text: MENTIONED_RULE }], messages: c.chat.map((m) => ({ role: m.role, content: m.content })) });
+      const msg = { role: 'assistant', content: stripJSONBlocks(r.text), cases: lastJSON(r.text)?.cases || [] };
+      c.chat.push(msg);
+      out.innerHTML = md(msg.content);
+      out.after(candidateCards(p, msg.cases, prop?.id, { unverified: true, title: 'Cases mentioned' }));
       await save('cases', c);
     } catch {
       c.chat.pop(); // drop the unanswered question so the conversation stays valid
