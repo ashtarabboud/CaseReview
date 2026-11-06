@@ -9,7 +9,7 @@ import { extractDocxBlocks, buildDocx } from './shared/docx.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '15';
+const APP_VERSION = '16';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -952,6 +952,7 @@ async function viewProject(pid, tab, q = {}) {
     const ours = props.filter((x) => !x.theirs);
     const theirs = props.filter((x) => x.theirs);
     const research = ours.filter((x) => x.kind === 'research_needed').length;
+    main.append(autopilotCard(p));
     main.append(h('p', { class: 'small muted' }, `${ours.length} of our points · ${research} need research${theirs.length ? ` · ${theirs.length} of their arguments` : ''}. Tap a point to work on it.`));
     const filingsById = Object.fromEntries((await projectFilings(pid)).map((f) => [f.id, f]));
     let lastSection = null;
@@ -963,7 +964,9 @@ async function viewProject(pid, tab, q = {}) {
         h('div', { class: 'row', style: 'margin-bottom:4px' },
           prop.theirs ? h('span', { class: 'badge bad' }, '⚔️ Their argument') : null,
           !prop.theirs && prop.kind === 'research_needed' ? h('span', { class: 'badge research' }, '🔎 Needs research') : null,
-          prop.paragraph ? h('span', { class: 'badge ok' }, '✍️ Paragraph drafted') : null),
+          prop.paragraph ? h('span', { class: 'badge ok' }, '✍️ Paragraph drafted') : null,
+          prop.auto?.done ? h('span', { class: 'badge ok' }, '🤖 Researched') : null,
+          linked.length ? h('span', { class: 'badge' }, `${linked.filter((c) => c.support?.[prop.id]).length}/${linked.length} checked`) : null),
         h('div', {}, prop.text),
         prop.bracket ? h('div', { class: 'small note' }, prop.bracket) : null,
         linked.length ? h('div', { style: 'margin-top:6px' }, linked.map((c) => h('span', { class: 'chip' + (c.text ? ' pulled' : '') }, c.support?.[prop.id]?.verdict ? VERDICTS[c.support[prop.id].verdict]?.label.split(' ')[0] : (c.text ? '📖' : '·'), ' ', caseTitle(c)))) : null));
@@ -1342,7 +1345,7 @@ async function viewProp(pid, propId) {
     const pin = prop.citations?.find((x) => normCite(x.citation) === normCite(c.citation))?.pincite;
     main.append(h('div', { class: 'card tap', onclick: () => go(`#/c/${c.id}?prop=${prop.id}&tab=${c.text ? (sup ? 'read' : 'support') : 'read'}`) },
       h('h3', {}, caseTitle(c)),
-      h('div', { class: 'small muted' }, [c.citation, pin ? 'pin ' + pin : null, c.text ? '📖 ready' : 'tap to pull the case'].filter(Boolean).join(' · ')),
+      h('div', { class: 'small muted' }, [c.citation, pin ? 'pin ' + pin : null, c.text ? '📖 ready' : c.pullError ? '⚠️ couldn’t find it free online — upload from Westlaw' : 'tap to pull the case'].filter(Boolean).join(' · ')),
       h('div', { class: 'row', style: 'margin-top:6px' },
         sup ? verdictBadge(sup.verdict) : (c.text ? h('span', { class: 'badge' }, 'Support not checked yet') : null),
         c.rec?.propId === prop.id ? recBadge(c.rec.value) : null,
@@ -1354,6 +1357,8 @@ async function viewProp(pid, propId) {
           route();
         } }, 'Remove'))));
   }
+  main.append(h('button', { class: 'btn big', style: 'margin-bottom:8px', disabled: AUTO.running, onclick: () => { startAutopilot(pid, { onlyPropId: prop.id, rounds: 2 }); toast('Autopilot started on this point — progress shows at the bottom'); } },
+    AUTO.running ? '🤖 Autopilot is running…' : prop.auto?.done ? '🤖 Run the sequence again (finds more cases)' : '🤖 Run the full sequence on this point'));
   main.append(h('div', { class: 'btns' },
     h('button', { class: 'btn', onclick: async () => { const c = await addCaseSheet(p, prop.id); if (c) go(`#/c/${c.id}?prop=${prop.id}${c.text ? '' : '&pull=1'}`); } }, '＋ Add a case'),
     h('button', { class: 'btn', onclick: (e) => checkAll(e.currentTarget) }, '⚖️ Check all cases')));
@@ -1423,47 +1428,7 @@ async function viewProp(pid, propId) {
     resCands.innerHTML = '';
     const have = linked.map((c) => `- ${caseTitle(c)} ${c.citation || ''}`).join('\n') || '(none yet)';
     try {
-      const r = await streamInto(resOut, {
-        system: systemFor(p),
-        messages: [{ role: 'user', content: prop.theirs ? `This is the OTHER SIDE'S argument. Find case law that undermines, limits, or distinguishes it — authority we can use in response.
-
-THEIR ARGUMENT: ${prop.text}
-CASES THEY CITE:
-${have}
-JURISDICTION: ${p.court || 'not specified — infer from the filings'}
-
-Use web search. Prioritize binding authority, then persuasive authority from the same district/circuit. Look for: cases rejecting their proposition, cases limiting the cases they cite, and cases with facts closer to ours that come out the other way. Only suggest cases you actually saw in search results or fetched pages, and include the URL where you found each.
-
-Write for me in plain English:
-1. A short overview: how vulnerable is their argument?
-2. For each case: what it held and exactly how it helps us answer their argument (step by step), plus any quote you saw word-for-word.
-3. Anything that supports THEM that we need to deal with.
-
-Then end with a \`\`\`json block: {"cases":[{"case_name":"","citation":"full reporter citation","court":"","year":"","url":"","why":"one sentence","strength":"strong|moderate|weak"}]}` : `Find case law that supports this point in my brief.
-
-POINT: ${prop.text}
-${prop.bracket ? 'MY RESEARCH NOTE: ' + prop.bracket : ''}
-SECTION: ${prop.section || ''}
-JURISDICTION: ${p.court || 'not specified — infer from my brief'}
-CASES I ALREADY HAVE:
-${have}
-
-Use web search. Prioritize binding authority (the controlling appellate court and the highest court for my jurisdiction), then persuasive authority from the same district/circuit, then others. Prefer recent, frequently-cited cases. Only suggest cases you actually saw in search results or fetched pages — never from memory alone — and include the URL where you found each.
-
-Write for me in plain English:
-1. A short overview of what you found and how strong the support is.
-2. For each case: what it held, in one or two sentences, and exactly how it supports my point (step by step), plus any quote you saw word-for-word.
-3. Anything that cuts against my point.
-
-Then end with a \`\`\`json block: {"cases":[{"case_name":"","citation":"full reporter citation","court":"","year":"","url":"","why":"one sentence","strength":"strong|moderate|weak"}]}` }],
-        tools: [
-          { type: 'web_search_20250305', name: 'web_search', max_uses: 8 },
-          { type: 'web_fetch_20250910', name: 'web_fetch', max_uses: 4, max_content_tokens: 60000 },
-        ],
-        maxTokens: 32000,
-      });
-      const json = lastJSON(r.text);
-      const out = { text: stripJSONBlocks(r.text), cases: json?.cases || [], at: Date.now() };
+      const out = await researchPoint(p, prop, linked, resOut);
       await persist((fp) => { fp.research = out; });
       prop.research = out;
       showResearch(out);
@@ -1584,6 +1549,291 @@ Output exactly two parts:
     } catch {}
     done();
   }
+}
+
+/** Web search for cases for one point (theirs: authority against it). Same prompt the point page uses. */
+async function researchPoint(p, prop, linked, outEl) {
+  const have = linked.map((c) => `- ${caseTitle(c)} ${c.citation || ''}`).join('\n') || '(none yet)';
+  const r = await streamInto(outEl, {
+    system: systemFor(p),
+    messages: [{ role: 'user', content: prop.theirs ? `This is the OTHER SIDE'S argument. Find case law that undermines, limits, or distinguishes it — authority we can use in response.
+
+THEIR ARGUMENT: ${prop.text}
+CASES THEY CITE:
+${have}
+JURISDICTION: ${p.court || 'not specified — infer from the filings'}
+
+Use web search. Prioritize binding authority, then persuasive authority from the same district/circuit. Look for: cases rejecting their proposition, cases limiting the cases they cite, and cases with facts closer to ours that come out the other way. Only suggest cases you actually saw in search results or fetched pages, and include the URL where you found each.
+
+Write for me in plain English:
+1. A short overview: how vulnerable is their argument?
+2. For each case: what it held and exactly how it helps us answer their argument (step by step), plus any quote you saw word-for-word.
+3. Anything that supports THEM that we need to deal with.
+
+Then end with a \`\`\`json block: {"cases":[{"case_name":"","citation":"full reporter citation","court":"","year":"","url":"","why":"one sentence","strength":"strong|moderate|weak"}]}` : `Find case law that supports this point in my brief.
+
+POINT: ${prop.text}
+${prop.bracket ? 'MY RESEARCH NOTE: ' + prop.bracket : ''}
+SECTION: ${prop.section || ''}
+JURISDICTION: ${p.court || 'not specified — infer from my brief'}
+CASES I ALREADY HAVE:
+${have}
+
+Use web search. Prioritize binding authority (the controlling appellate court and the highest court for my jurisdiction), then persuasive authority from the same district/circuit, then others. Prefer recent, frequently-cited cases. Only suggest cases you actually saw in search results or fetched pages — never from memory alone — and include the URL where you found each.
+
+Write for me in plain English:
+1. A short overview of what you found and how strong the support is.
+2. For each case: what it held, in one or two sentences, and exactly how it supports my point (step by step), plus any quote you saw word-for-word.
+3. Anything that cuts against my point.
+
+Then end with a \`\`\`json block: {"cases":[{"case_name":"","citation":"full reporter citation","court":"","year":"","url":"","why":"one sentence","strength":"strong|moderate|weak"}]}` }],
+    tools: [
+  { type: 'web_search_20250305', name: 'web_search', max_uses: 8 },
+  { type: 'web_fetch_20250910', name: 'web_fetch', max_uses: 4, max_content_tokens: 60000 },
+    ],
+    maxTokens: 32000,
+  });
+  const json = lastJSON(r.text);
+  const out = { text: stripJSONBlocks(r.text), cases: json?.cases || [], at: Date.now() };
+  return out;
+}
+
+/* ============================== Autopilot: run the research sequence on every point ============================== */
+// For each point, in order, one request at a time (the same calls the buttons make):
+//   1. existing cases: pull if needed, then "Does this case support my point?"
+//   2. "Find cases that support this" → add every suggested case → pull each → support check each
+//   3. "Find more cases" (same search, which skips cases already on the point) → pull + check the new ones
+// Every step is saved as it finishes, so stopping or a dropped connection loses nothing: running
+// again skips whatever is already done.
+
+const AUTO = { running: false, stop: false, pid: null, total: 0, index: 0, point: '', step: '', log: [], lock: null, finished: null, sink: null };
+
+const autoLog = (msg, kind = 'info') => {
+  AUTO.log.push({ at: Date.now(), msg, kind });
+  if (AUTO.log.length > 400) AUTO.log.shift();
+  updateAutoUI();
+};
+const autoStep = (msg) => { AUTO.step = msg; updateAutoUI(); };
+const isFatal = (e) => e instanceof NeedKey || [401, 403].includes(e?.status) || /credit balance/i.test(e?.message || '');
+
+function pointNeedsRun(prop, opts) {
+  if (prop.theirs && !opts.theirs) return false;
+  return !(prop.auto?.done && (prop.auto.rounds || 0) >= opts.rounds);
+}
+
+async function startAutopilot(pid, { onlyPropId = null, rounds = 2, theirs = false } = {}) {
+  if (AUTO.running) { toast('Autopilot is already running'); return; }
+  const p = await db.get('projects', pid);
+  const opts = { rounds, theirs: theirs || !!onlyPropId };
+  const queue = (p.props || []).filter((x) => (onlyPropId ? x.id === onlyPropId : pointNeedsRun(x, opts))).map((x) => x.id);
+  if (!queue.length) { toast('Every point has already been through the sequence'); return; }
+  Object.assign(AUTO, { running: true, stop: false, pid, total: queue.length, index: 0, point: '', step: 'Starting…', log: [], finished: null, sink: h('div', { class: 'md' }) });
+  p.autopilot = { active: true, opts, startedAt: Date.now() };
+  await save('projects', p);
+  AUTO.lock = await keepAwake();
+  autoLog(`Started on ${queue.length} point${queue.length === 1 ? '' : 's'}.`);
+  let fatal = null;
+  try {
+    for (const propId of queue) {
+      if (AUTO.stop) break;
+      AUTO.index++;
+      try { await autopilotPoint(pid, propId, opts); }
+      catch (e) {
+        if (isFatal(e)) { fatal = e; break; }
+        autoLog(`Skipped the rest of this point: ${friendlyError(e)}`, 'warn');
+      }
+    }
+  } finally {
+    const fresh = await db.get('projects', pid);
+    if (fresh) { fresh.autopilot = { ...(fresh.autopilot || {}), active: !!(AUTO.stop || fatal), endedAt: Date.now() }; await save('projects', fresh); }
+    AUTO.lock?.release?.().catch(() => {});
+    AUTO.lock = null;
+    AUTO.running = false;
+    AUTO.finished = fatal ? `Stopped: ${friendlyError(fatal)}` : AUTO.stop ? 'Stopped. Run it again to pick up where it left off.' : `Done — ${AUTO.total} point${AUTO.total === 1 ? '' : 's'} researched.`;
+    autoLog(AUTO.finished, fatal ? 'error' : 'done');
+    AUTO.step = '';
+    if (location.hash.includes(`/p/${pid}`) && !location.hash.includes('/prop/')) route();
+  }
+}
+
+async function autopilotPoint(pid, propId, opts) {
+  const load = async () => { const p = await db.get('projects', pid); return { p, prop: p?.props?.find((x) => x.id === propId) }; };
+  const update = async (mut) => { const p = await db.get('projects', pid); const fp = p.props.find((x) => x.id === propId); mut(fp); await save('projects', p); return fp; };
+  let { p, prop } = await load();
+  if (!prop) return;
+  AUTO.point = prop.text;
+  autoLog(`Point ${AUTO.index} of ${AUTO.total}: ${cap(prop.text, 90)}`, 'point');
+
+  // A point you already searched by hand counts as round 1 (its suggestions get added and checked).
+  if (!prop.auto && prop.research?.cases?.length) {
+    const added = await linkCandidates(pid, propId, prop.research.cases);
+    await update((fp) => { fp.auto = { rounds: 1 }; });
+    if (added) autoLog(`Added ${added} cases from your earlier search`);
+  }
+
+  await checkPointCases(pid, propId);
+  for (let round = 1; round <= opts.rounds; round++) {
+    if (AUTO.stop) return;
+    ({ p, prop } = await load());
+    if ((prop.auto?.rounds || 0) >= round) continue;
+    autoStep(round === 1 ? 'Finding cases that support this point…' : `Finding more cases (round ${round})…`);
+    const linked = (await projectCases(pid)).filter((c) => (prop.caseIds || []).includes(c.id));
+    const out = await withRateLimitRetry(() => researchPoint(p, prop, linked, AUTO.sink));
+    const added = await linkCandidates(pid, propId, out.cases);
+    await update((fp) => {
+      fp.research = out;
+      fp.researchHistory = [...(fp.researchHistory || []), out];
+      fp.auto = { ...(fp.auto || {}), rounds: round };
+    });
+    autoLog(`Search ${round}: ${out.cases.length} suggested, ${added} new`);
+    await checkPointCases(pid, propId);
+  }
+  if (AUTO.stop) return;
+  await update((fp) => { fp.auto = { ...(fp.auto || {}), done: true, at: Date.now() }; });
+  autoLog('✓ Point finished', 'ok');
+}
+
+/** Add every suggested case to the point (pulling happens next). Returns how many were new. */
+async function linkCandidates(pid, propId, cands) {
+  let added = 0;
+  for (const cand of cands || []) {
+    if (!cand.case_name && !cand.citation) continue;
+    const p = await db.get('projects', pid);
+    const c = await findOrCreateCase(p, { case_name: cand.case_name, citation: cand.citation, url: cand.url });
+    const again = await db.get('projects', pid);
+    const fp = again.props.find((x) => x.id === propId);
+    if (!fp.caseIds.includes(c.id)) { fp.caseIds.push(c.id); added++; await save('projects', again); }
+  }
+  return added;
+}
+
+/** Pull (if needed) and support-check every case on the point — one case, one request, at a time. */
+async function checkPointCases(pid, propId) {
+  const p0 = await db.get('projects', pid);
+  const ids = [...(p0.props.find((x) => x.id === propId)?.caseIds || [])];
+  for (const id of ids) {
+    if (AUTO.stop) return;
+    const c = await db.get('cases', id);
+    if (!c) continue;
+    if (!c.text && !c.pullError) {
+      autoStep(`Pulling ${caseTitle(c)}…`);
+      try {
+        await withRateLimitRetry(() => pullCase(c, (m) => autoStep(`${caseTitle(c)}: ${m}`)));
+        await save('cases', c);
+        autoLog(`Pulled ${caseTitle(c)}${c.source ? ` (${c.source})` : ''}`);
+      } catch (e) {
+        if (isFatal(e)) throw e;
+        const fresh = await db.get('cases', id);
+        fresh.pullError = friendlyError(e).split('\n')[0];
+        await save('cases', fresh);
+        autoLog(`Couldn’t pull ${caseTitle(c)} — upload it from Westlaw`, 'warn');
+        continue;
+      }
+    }
+    const fresh = await db.get('cases', id);
+    if (!fresh.text || fresh.support?.[propId]) continue;
+    const { p, prop } = await (async () => { const pp = await db.get('projects', pid); return { p: pp, prop: pp.props.find((x) => x.id === propId) }; })();
+    autoStep(`Does ${caseTitle(fresh)} support the point?`);
+    try {
+      const r = await withRateLimitRetry(() => runSupportCheck(p, fresh, prop, AUTO.sink));
+      autoLog(`${caseTitle(fresh)}: ${VERDICTS[r.verdict]?.label || 'checked'}`, r.verdict === 'strong' ? 'ok' : 'info');
+    } catch (e) {
+      if (isFatal(e)) throw e;
+      autoLog(`Check failed for ${caseTitle(fresh)}: ${friendlyError(e)}`, 'warn');
+    }
+  }
+}
+
+async function withRateLimitRetry(fn) {
+  try { return await fn(); }
+  catch (e) {
+    if (e?.status !== 429 && e?.status !== 529) throw e;
+    autoStep('Claude is busy — waiting a minute, then continuing…');
+    await sleep(60000);
+    return fn();
+  }
+}
+
+// Keep the screen on for the whole run (the lock drops when the app is hidden; take it back on return).
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && AUTO.running) AUTO.lock = await keepAwake();
+});
+
+/* ---- Autopilot UI ---- */
+
+function autoPill() {
+  let pill = document.getElementById('autopill');
+  if (!pill) {
+    pill = h('button', { id: 'autopill', class: 'autopill', onclick: autoLogSheet });
+    document.body.append(pill);
+  }
+  return pill;
+}
+
+function updateAutoUI() {
+  const pill = autoPill();
+  if (AUTO.running) {
+    pill.classList.remove('hidden');
+    pill.replaceChildren(h('span', { class: 'spin' }), h('span', { class: 'grow' }, h('strong', {}, `Point ${AUTO.index}/${AUTO.total}`), ' · ', AUTO.stop ? 'stopping after this step…' : AUTO.step));
+  } else if (AUTO.finished) {
+    pill.classList.remove('hidden');
+    pill.replaceChildren(h('span', {}, '🤖'), h('span', { class: 'grow' }, AUTO.finished), h('span', { class: 'x', onclick: (e) => { e.stopPropagation(); AUTO.finished = null; pill.classList.add('hidden'); } }, '✕'));
+  } else pill.classList.add('hidden');
+  const card = document.getElementById('autocard-live');
+  if (card) renderAutoLive(card);
+}
+
+function renderAutoLive(el) {
+  el.replaceChildren(
+    h('div', { class: 'row' }, h('span', { class: 'spin' }), h('strong', { class: 'grow' }, `Point ${AUTO.index} of ${AUTO.total}`),
+      h('button', { class: 'btn slim danger', disabled: AUTO.stop, onclick: () => { AUTO.stop = true; updateAutoUI(); } }, AUTO.stop ? 'Stopping…' : '■ Stop')),
+    h('p', { class: 'small', style: 'margin:6px 0' }, AUTO.point),
+    h('p', { class: 'small muted', style: 'margin:0 0 6px' }, AUTO.step),
+    h('div', { class: 'autolog' }, AUTO.log.slice(-8).map((l) => h('div', { class: 'l-' + l.kind }, l.msg))),
+    h('details', { style: 'margin-top:6px' }, h('summary', { class: 'small' }, 'Watch Claude work'), AUTO.sink || ''));
+}
+
+async function autoLogSheet() {
+  const body = h('div', {},
+    AUTO.running ? h('button', { class: 'btn danger', disabled: AUTO.stop, onclick: () => { AUTO.stop = true; updateAutoUI(); } }, AUTO.stop ? 'Stopping after this step…' : '■ Stop after this step') : null,
+    AUTO.pid ? h('button', { class: 'btn', style: 'margin-left:8px', onclick: () => { $('#sheet-root').innerHTML = ''; go(`#/p/${AUTO.pid}?tab=points`); } }, 'Open the points') : null,
+    h('div', { class: 'autolog full' }, AUTO.log.map((l) => h('div', { class: 'l-' + l.kind }, `${new Date(l.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })} · ${l.msg}`))));
+  await sheet('Autopilot', body, []);
+}
+
+function autopilotCard(p) {
+  const props = p.props || [];
+  const rounds = h('select', {}, [1, 2, 3].map((n) => h('option', { value: n, selected: n === 2 }, `${n} search${n > 1 ? 'es' : ''} per point`)));
+  const theirsBox = h('input', { type: 'checkbox' });
+  const countFor = () => props.filter((x) => pointNeedsRun(x, { rounds: +rounds.value, theirs: theirsBox.checked })).length;
+  const label = h('span', {});
+  const btn = h('button', { class: 'btn primary big', onclick: () => {
+    const n = countFor();
+    if (!n) return toast('Every point has already been through the sequence');
+    const lo = Math.round(n * 2), hi = Math.round(n * 5);
+    if (!confirm(`Run the full sequence on ${n} point${n === 1 ? '' : 's'}?\n\nFor each point: check the cases already there, search for supporting cases, add and pull every one, check each, then search again and check the new ones.\n\nRough cost with ${MODELS.find((m) => m.id === S.get().model)?.label.split(' —')[0] || 'your model'}: about $${lo}–$${hi} total (Sonnet is about half). Keep the app open on screen.`)) return;
+    startAutopilot(p.id, { rounds: +rounds.value, theirs: theirsBox.checked });
+    setTimeout(route, 50);
+  } }, label);
+  const refresh = () => { const n = countFor(); label.textContent = n ? `▶ Run on ${n} point${n === 1 ? '' : 's'}` : '✓ All points done'; btn.disabled = !n; };
+  rounds.addEventListener('change', refresh);
+  theirsBox.addEventListener('change', refresh);
+  refresh();
+
+  if (AUTO.running && AUTO.pid === p.id) {
+    const live = h('div', { class: 'card autocard', id: 'autocard-live' });
+    renderAutoLive(live);
+    return live;
+  }
+  const doneN = props.filter((x) => x.auto?.done).length;
+  const interrupted = p.autopilot?.active && !AUTO.running;
+  return h('div', { class: 'card autocard' },
+    h('h3', {}, '🤖 Autopilot'),
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'Does the clicking for you, point by point: checks the cases already on the point, searches for supporting cases, adds and pulls every one (even weak ones), runs “Does it support my point?” on each, then searches again and checks the new ones. One case at a time, saved as it goes.'),
+    interrupted ? h('div', { class: 'banner small' }, 'The last run was interrupted. Running again picks up exactly where it stopped.') : null,
+    h('div', { class: 'row', style: 'margin-bottom:8px' }, rounds, props.some((x) => x.theirs) ? h('label', { class: 'small row', style: 'gap:6px' }, theirsBox, 'Include their arguments') : null),
+    btn,
+    h('p', { class: 'small muted', style: 'margin:8px 0 0' }, `${doneN} of ${props.length} points done. On an iPad or phone: turn Auto-Lock off (Settings → Display & Brightness) and leave the app open.`));
 }
 
 /* ============================== Case view ============================== */
