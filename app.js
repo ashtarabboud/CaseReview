@@ -9,7 +9,7 @@ import { extractDocxBlocks, buildDocx } from './shared/docx.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '14';
+const APP_VERSION = '15';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -48,7 +48,22 @@ const S = {
 
 navigator.storage?.persist?.().catch(() => {});
 
-const projectCases = async (pid) => (await db.all('cases')).filter((c) => c.projectId === pid);
+const isFiling = (c) => c?.kind === 'filing';
+// Cases (opinions) only, unless { filings: true }. The other side's filings are stored alongside but listed separately.
+const projectCases = async (pid, { filings = false } = {}) => (await db.all('cases')).filter((c) => c.projectId === pid && (filings || !isFiling(c)));
+const projectFilings = async (pid) => (await db.all('cases')).filter((c) => c.projectId === pid && isFiling(c));
+const DOC_TYPES = { complaint: 'Complaint', motion: 'Motion', brief: 'Brief / memorandum', other: 'Other filing' };
+const docLabel = (c) => DOC_TYPES[c.docType] || 'Filing';
+
+/** The matter details the user entered (where it's filed, served date, plans) as plain lines. */
+function matterText(p) {
+  const m = p.matter || {};
+  return [
+    m.served ? `DATE WE WERE SERVED: ${m.served}` : null,
+    m.plans ? `OUR PLANS / STRATEGY: ${m.plans}` : null,
+    m.notes ? `OTHER DETAILS: ${m.notes}` : null,
+  ].filter(Boolean).join('\n');
+}
 const save = (store, o) => { o.updatedAt = Date.now(); return db.put(store, o); };
 
 /* ============================== Small DOM helpers ============================== */
@@ -349,9 +364,16 @@ const stripJSONBlocks = (text) => text.replace(/```json[\s\S]*?```/g, '').trim()
 function systemFor(p, c) {
   const blocks = [{ type: 'text', text: S.get().style + BASE_RULES }];
   let ctx = `PROJECT: ${p.name}\nCOURT / JURISDICTION: ${p.court || 'not specified'}\nOUR SIDE: ${p.side || 'not specified'}`;
+  if (matterText(p)) ctx += '\n' + matterText(p);
   if (p.draft) ctx += `\n\nMY DRAFT BRIEF (context for everything we discuss):\n<brief>\n${p.draft}\n</brief>`;
   blocks.push({ type: 'text', text: ctx, cache_control: { type: 'ephemeral' } });
-  if (c?.text) {
+  if (c?.text && isFiling(c)) {
+    blocks.push({
+      type: 'text',
+      text: `THE OTHER SIDE'S ${docLabel(c).toUpperCase()} WE ARE READING: ${c.name}\n(This is the opposing party's filing, not a court opinion. Paragraph numbers like "12." are the filing's own numbered paragraphs.)\n<document>\n${c.text}\n</document>`,
+      cache_control: { type: 'ephemeral' },
+    });
+  } else if (c?.text) {
     blocks.push({
       type: 'text',
       text: `THE CASE WE ARE READING: ${c.name}${c.citation ? ', ' + c.citation : ''}${c.court ? ' (' + c.court + (c.year ? ' ' + c.year : '') + ')' : ''}\n<opinion>\n${c.text}\n</opinion>`,
@@ -573,6 +595,7 @@ async function deleteCase(c, after) {
   if (!confirm(`Delete “${caseTitle(c)}” and all its highlights, notes, and chat? This can’t be undone.`)) return false;
   const p = await db.get('projects', c.projectId);
   for (const prop of p?.props || []) prop.caseIds = (prop.caseIds || []).filter((x) => x !== c.id);
+  if (p && isFiling(c)) p.props = (p.props || []).filter((x) => x.filingId !== c.id); // its mapped arguments go with it
   if (p) await save('projects', p);
   await db.del('cases', c.id);
   toast('Case deleted');
@@ -698,6 +721,7 @@ async function viewHome() {
   main.append(
     h('div', { class: 'stack' },
       h('button', { class: 'btn primary big', onclick: newProjectSheet }, '＋ New brief or motion'),
+      h('button', { class: 'btn big', onclick: newFilingProjectSheet }, '📑 Review a complaint or the other side’s filing'),
       h('button', { class: 'btn big', onclick: quickCase }, '📄 Just explain one case')),
     h('div', { class: 'section-title' }, 'Your projects'));
   if (!projects.length) main.append(h('p', { class: 'muted' }, 'No projects yet. Start one by uploading your draft motion — or just explain a single case.'));
@@ -897,7 +921,7 @@ async function viewProject(pid, tab, q = {}) {
   if (p.analyzing && Date.now() - (p.updatedAt || 0) > 15 * 60 * 1000) { p.analyzing = false; p.analyzeError = 'The last analysis didn’t finish (the app may have been closed). Try again.'; await save('projects', p); }
   const cases = await projectCases(pid);
   const menu = h('button', { class: 'iconbtn', 'aria-label': 'Project menu', onclick: () => projectMenu(p) }, '⋯');
-  const items = p.quick ? [['cases', 'Cases'], ['research', 'Research chat']] : [['points', 'Points'], ['draft', 'Draft & review'], ['research', 'Research chat'], ['cases', `Cases (${cases.length})`], ['brief', 'Uploaded draft']];
+  const items = p.quick ? [['cases', 'Cases'], ['research', 'Research chat']] : [['points', 'Points'], ['filings', 'Their filings'], ['draft', 'Draft & review'], ['research', 'Research chat'], ['cases', `Cases (${cases.length})`], ['brief', 'Uploaded draft']];
   if (p.quick && tab !== 'research') tab = 'cases';
   const main = h('main', {});
   app.replaceChildren(header(p.name, '#/', p.court || null, menu), tabs(items, tab, (k) => `#/p/${pid}?tab=${k}`), main);
@@ -912,6 +936,7 @@ async function viewProject(pid, tab, q = {}) {
     }
     if (!props.length) {
       main.append(h('div', { class: 'card stack' },
+        h('p', { class: 'small muted', style: 'margin:0' }, 'Reviewing the other side’s complaint or motion? Use the “Their filings” tab.'),
         h('h3', {}, p.draft ? 'Ready to go through your draft' : 'Add your draft'),
         h('p', { class: 'muted', style: 'margin:0' }, p.draft
           ? 'I’ll go through it point by point: each legal proposition, the cases you cited for it, and every [bracket] where you still need authority.'
@@ -924,15 +949,20 @@ async function viewProject(pid, tab, q = {}) {
       }
       return;
     }
-    const research = props.filter((x) => x.kind === 'research_needed').length;
-    main.append(h('p', { class: 'small muted' }, `${props.length} points · ${research} need research. Tap a point to work on it.`));
+    const ours = props.filter((x) => !x.theirs);
+    const theirs = props.filter((x) => x.theirs);
+    const research = ours.filter((x) => x.kind === 'research_needed').length;
+    main.append(h('p', { class: 'small muted' }, `${ours.length} of our points · ${research} need research${theirs.length ? ` · ${theirs.length} of their arguments` : ''}. Tap a point to work on it.`));
+    const filingsById = Object.fromEntries((await projectFilings(pid)).map((f) => [f.id, f]));
     let lastSection = null;
-    for (const prop of props) {
-      if (prop.section !== lastSection) { main.append(h('div', { class: 'section-title' }, prop.section || 'General')); lastSection = prop.section; }
+    for (const prop of [...ours, ...theirs]) {
+      const sectionKey = prop.theirs ? `Their arguments — ${filingsById[prop.filingId]?.name || 'their filing'}${prop.section ? ' · ' + prop.section : ''}` : (prop.section || 'General');
+      if (sectionKey !== lastSection) { main.append(h('div', { class: 'section-title' + (prop.theirs ? ' theirs' : '') }, sectionKey)); lastSection = sectionKey; }
       const linked = (prop.caseIds || []).map((id) => cases.find((c) => c.id === id)).filter(Boolean);
       main.append(h('div', { class: 'card tap', onclick: () => go(`#/p/${pid}/prop/${prop.id}`) },
         h('div', { class: 'row', style: 'margin-bottom:4px' },
-          prop.kind === 'research_needed' ? h('span', { class: 'badge research' }, '🔎 Needs research') : null,
+          prop.theirs ? h('span', { class: 'badge bad' }, '⚔️ Their argument') : null,
+          !prop.theirs && prop.kind === 'research_needed' ? h('span', { class: 'badge research' }, '🔎 Needs research') : null,
           prop.paragraph ? h('span', { class: 'badge ok' }, '✍️ Paragraph drafted') : null),
         h('div', {}, prop.text),
         prop.bracket ? h('div', { class: 'small note' }, prop.bracket) : null,
@@ -956,6 +986,7 @@ async function viewProject(pid, tab, q = {}) {
   }
 
   if (tab === 'draft') return draftTab(main, p, q);
+  if (tab === 'filings') return filingsTab(main, p);
 
   if (tab === 'research') return researchTab(main, p, cases);
 
@@ -973,17 +1004,18 @@ async function projectMenu(p) {
   const side = h('input', { type: 'text', value: p.side || '' });
   const del = h('button', { class: 'btn danger', style: 'margin-top:16px', onclick: async () => {
     if (!confirm(`Delete “${p.name}” and all its cases and notes? This can’t be undone.`)) return;
-    for (const c of await projectCases(p.id)) await db.del('cases', c.id);
+    for (const c of await projectCases(p.id, { filings: true })) await db.del('cases', c.id);
     await db.del('projects', p.id);
     $('#sheet-root').innerHTML = '';
     go('#/');
   } }, '🗑 Delete project');
+  const mf = matterFields(p);
   const ok = await sheet('Project details', h('div', {},
     h('label', { class: 'f' }, 'Name'), name,
     h('label', { class: 'f' }, 'Court / jurisdiction'), court,
-    h('label', { class: 'f' }, 'Our side'), side, del), [{ label: 'Save', run: () => true }]);
+    h('label', { class: 'f' }, 'Our side'), side, mf.el, del), [{ label: 'Save', run: () => true }]);
   if (ok) {
-    Object.assign(p, { name: name.value.trim() || p.name, court: court.value.trim(), side: side.value.trim() });
+    Object.assign(p, { name: name.value.trim() || p.name, court: court.value.trim(), side: side.value.trim(), matter: mf.value() });
     await save('projects', p);
     route();
   }
@@ -1151,6 +1183,8 @@ function projectOverview(p, cases) {
   }
   const loose = cases.filter((c) => !(p.props || []).some((x) => (x.caseIds || []).includes(c.id)));
   if (loose.length) lines.push('OTHER CASES IN THIS PROJECT: ' + loose.map((c) => caseTitle(c) + (c.citation ? ', ' + c.citation : '')).join('; '));
+  const theirs = (p.props || []).filter((x) => x.theirs);
+  if (theirs.length) lines.push(`(${theirs.length} of the points above are the OTHER SIDE'S arguments, mapped from their filing — we are answering them.)`);
   return lines.join('\n') || 'No points or cases saved yet.';
 }
 
@@ -1202,7 +1236,7 @@ function researchTab(main, p, cases) {
     bubble.scrollIntoView({ block: 'end', behavior: 'smooth' });
     try {
       const r = await streamInto(out, {
-        system: [...withManual(systemFor(p)), { type: 'text', text: `You are my legal research partner for this whole project. Answer research questions, explain the law, brainstorm arguments, anticipate the other side's counterarguments, and find authority. Use web search whenever the answer depends on case law, statutes, rules, or current law — especially in ${p.court || 'my jurisdiction'} — and link your sources. Prefer binding authority. Be clear about what you verified in a source versus what is general knowledge.
+        system: [...withManual(systemFor(p)), ...(await filingsBlock(p)), { type: 'text', text: `You are my legal research partner for this whole project. Answer research questions, explain the law, brainstorm arguments, anticipate the other side's counterarguments, and find authority. Use web search whenever the answer depends on case law, statutes, rules, or current law — especially in ${p.court || 'my jurisdiction'} — and link your sources. Prefer binding authority. Be clear about what you verified in a source versus what is general knowledge.
 
 ${CASES_JSON_RULE}
 
@@ -1290,17 +1324,19 @@ async function viewProp(pid, propId) {
   const cases = (await projectCases(pid));
   const linked = (prop.caseIds || []).map((id) => cases.find((c) => c.id === id)).filter(Boolean);
   const main = h('main', {});
-  app.replaceChildren(header('Point', `#/p/${pid}?tab=points`, prop.section), main);
+  app.replaceChildren(header(prop.theirs ? 'Their argument' : 'Point', `#/p/${pid}?tab=points`, prop.section), main);
+  const fromFiling = prop.theirs ? (await db.get('cases', prop.filingId)) : null;
 
   main.append(h('div', { class: 'card' },
-    prop.kind === 'research_needed' ? h('span', { class: 'badge research' }, '🔎 Needs research') : null,
+    prop.theirs ? h('div', { class: 'row' }, h('span', { class: 'badge bad' }, '⚔️ The other side’s argument'), fromFiling ? h('a', { class: 'small', href: `#/c/${fromFiling.id}?tab=breakdown` }, `from ${fromFiling.name}`) : null) : null,
+    !prop.theirs && prop.kind === 'research_needed' ? h('span', { class: 'badge research' }, '🔎 Needs research') : null,
     h('p', { style: 'margin:6px 0; font-size:17px' }, prop.text),
     prop.bracket ? h('p', { class: 'note', style: 'margin:4px 0' }, prop.bracket) : null,
     h('div', { class: 'row' },
       h('button', { class: 'btn slim', onclick: editProp }, '✎ Edit'),
       h('button', { class: 'btn slim danger', onclick: deleteProp }, 'Remove'))));
 
-  main.append(h('div', { class: 'section-title' }, `Cases for this point (${linked.length})`));
+  main.append(h('div', { class: 'section-title' }, prop.theirs ? `Cases they cite (${linked.length})` : `Cases for this point (${linked.length})`));
   for (const c of linked) {
     const sup = c.support?.[prop.id];
     const pin = prop.citations?.find((x) => normCite(x.citation) === normCite(c.citation))?.pincite;
@@ -1323,12 +1359,12 @@ async function viewProp(pid, propId) {
     h('button', { class: 'btn', onclick: (e) => checkAll(e.currentTarget) }, '⚖️ Check all cases')));
 
   // Research
-  main.append(h('div', { class: 'section-title' }, 'Find more support'));
+  main.append(h('div', { class: 'section-title' }, prop.theirs ? 'Find authority against it' : 'Find more support'));
   const resOut = h('div', { class: 'md' });
   const resCands = h('div', {});
   const resCard = h('div', { class: 'card' },
-    h('p', { class: 'small muted', style: 'margin-top:0' }, prop.kind === 'research_needed' ? 'Your draft flags this point for research. I’ll search the web for cases in your jurisdiction that support it.' : 'Want stronger or binding authority? I’ll search for more cases that support this point.'),
-    h('button', { class: 'btn primary big', onclick: (e) => research(e.currentTarget) }, prop.research ? '🔎 Search again' : '🔎 Find cases that support this'),
+    h('p', { class: 'small muted', style: 'margin-top:0' }, prop.theirs ? 'I’ll search for cases that undercut or distinguish their argument.' : prop.kind === 'research_needed' ? 'Your draft flags this point for research. I’ll search the web for cases in your jurisdiction that support it.' : 'Want stronger or binding authority? I’ll search for more cases that support this point.'),
+    h('button', { class: 'btn primary big', onclick: (e) => research(e.currentTarget) }, prop.research ? '🔎 Search again' : prop.theirs ? '🔎 Find cases that cut against this' : '🔎 Find cases that support this'),
     resOut, resCands);
   main.append(resCard);
   if (prop.research) showResearch(prop.research);
@@ -1343,7 +1379,7 @@ async function viewProp(pid, propId) {
 
   const paraOut = h('div', {});
   main.append(h('div', { class: 'card' },
-    h('button', { class: 'btn primary big', onclick: (e) => writeParagraph(e.currentTarget) }, prop.paragraph ? '✍️ Rewrite the paragraph' : '✍️ Write the paragraph for my motion'),
+    h('button', { class: 'btn primary big', onclick: (e) => writeParagraph(e.currentTarget) }, prop.paragraph ? '✍️ Rewrite the paragraph' : prop.theirs ? '✍️ Write our response paragraph' : '✍️ Write the paragraph for my motion'),
     paraOut));
   if (prop.paragraph) showParagraph(prop.paragraph, prop.paragraphNotes);
 
@@ -1389,7 +1425,21 @@ async function viewProp(pid, propId) {
     try {
       const r = await streamInto(resOut, {
         system: systemFor(p),
-        messages: [{ role: 'user', content: `Find case law that supports this point in my brief.
+        messages: [{ role: 'user', content: prop.theirs ? `This is the OTHER SIDE'S argument. Find case law that undermines, limits, or distinguishes it — authority we can use in response.
+
+THEIR ARGUMENT: ${prop.text}
+CASES THEY CITE:
+${have}
+JURISDICTION: ${p.court || 'not specified — infer from the filings'}
+
+Use web search. Prioritize binding authority, then persuasive authority from the same district/circuit. Look for: cases rejecting their proposition, cases limiting the cases they cite, and cases with facts closer to ours that come out the other way. Only suggest cases you actually saw in search results or fetched pages, and include the URL where you found each.
+
+Write for me in plain English:
+1. A short overview: how vulnerable is their argument?
+2. For each case: what it held and exactly how it helps us answer their argument (step by step), plus any quote you saw word-for-word.
+3. Anything that supports THEM that we need to deal with.
+
+Then end with a \`\`\`json block: {"cases":[{"case_name":"","citation":"full reporter citation","court":"","year":"","url":"","why":"one sentence","strength":"strong|moderate|weak"}]}` : `Find case law that supports this point in my brief.
 
 POINT: ${prop.text}
 ${prop.bracket ? 'MY RESEARCH NOTE: ' + prop.bracket : ''}
@@ -1469,7 +1519,7 @@ Then end with a \`\`\`json block: {"cases":[{"case_name":"","citation":"full rep
     try {
       const r = await streamInto(synOut, {
         system: systemFor(p),
-        messages: [{ role: 'user', content: `Compare these cases and explain how they fit together to support my point.
+        messages: [{ role: 'user', content: `${prop.theirs ? 'This is the OTHER SIDE\'S argument. Compare the cases they rely on and tell me how well they actually hold up — where each is strong, overstated, or distinguishable from our facts.' : 'Compare these cases and explain how they fit together to support my point.'}
 
 POINT: ${prop.text}
 
@@ -1508,9 +1558,9 @@ Give me:
       await loadManual();
       const r = await streamInto(live, {
         system: withManual(systemFor(p)),
-        messages: [{ role: 'user', content: `Write the paragraph for my motion that makes this point.
+        messages: [{ role: 'user', content: `${prop.theirs ? 'Write the paragraph of OUR response that answers this argument of the other side (rebut it; use the authority below, including cases that cut against them).' : 'Write the paragraph for my motion that makes this point.'}
 
-POINT: ${prop.text}
+${prop.theirs ? 'THEIR ARGUMENT' : 'POINT'}: ${prop.text}
 SECTION: ${prop.section}
 ${prop.synthesis ? 'YOUR COMPARISON OF THE CASES:\n' + prop.synthesis + '\n' : ''}
 CASES I'VE REVIEWED (use ONLY these):
@@ -1550,20 +1600,23 @@ async function viewCase(cid, tab, propId) {
   if (!c) return go('#/');
   const p = await db.get('projects', c.projectId);
   const prop = p.props?.find((x) => x.id === propId);
-  const back = prop ? `#/p/${p.id}/prop/${prop.id}` : `#/p/${p.id}?tab=cases`;
+  const back = prop ? `#/p/${p.id}/prop/${prop.id}` : `#/p/${p.id}?tab=${isFiling(c) ? 'filings' : 'cases'}`;
   const qs = (t) => `#/c/${cid}?tab=${t}${propId ? '&prop=' + propId : ''}`;
   const menu = h('button', { class: 'iconbtn', 'aria-label': 'Case menu', onclick: () => caseMenu(c) }, '⋯');
   const main = h('main', {});
-  const items = [['read', 'Read'], ['breakdown', 'Break it down'], ...(p.quick ? [] : [['compare', 'Compare'], ['support', 'Support?']]), ['chat', 'Ask'], ['notes', 'Saved']];
-  const hdr = header(caseTitle(c), back, [c.citation, c.court, c.year].filter(Boolean).join(' · ') || null, menu);
+  const filing = isFiling(c);
+  const items = filing
+    ? [['read', 'Read'], ['breakdown', 'Review it'], ['chat', 'Ask'], ['notes', 'Saved']]
+    : [['read', 'Read'], ['breakdown', 'Break it down'], ...(p.quick ? [] : [['compare', 'Compare'], ['support', 'Support?']]), ['chat', 'Ask'], ['notes', 'Saved']];
+  const hdr = header(caseTitle(c), back, filing ? `Their ${docLabel(c).toLowerCase()} · ${p.name}` : ([c.citation, c.court, c.year].filter(Boolean).join(' · ') || null), menu);
   hdr.classList.add('compact');
-  if (!p.quick && p.props?.length) hdr.append(propBar(p, c, prop, tab));
+  if (!filing && !p.quick && p.props?.length) hdr.append(propBar(p, c, prop, tab));
   app.replaceChildren(hdr, tabs(items, tab, qs), main);
 
   if (!c.text) return getCasePanel(main, c, p);
 
   if (tab === 'read') return readTab(main, c, p, prop);
-  if (tab === 'breakdown') return breakdownTab(main, c, p, prop);
+  if (tab === 'breakdown') return filing ? filingReviewTab(main, c, p) : breakdownTab(main, c, p, prop);
   if (tab === 'support') return supportTab(main, c, p, prop);
   if (tab === 'compare') return compareTab(main, c, p, prop);
   if (tab === 'chat') return chatTab(main, c, p, prop);
@@ -1674,7 +1727,8 @@ function getCasePanel(main, c, p) {
 
 /* ---- Reader: cleaned-up text, tap-a-sentence highlighting ---- */
 
-const TEXT_FORMAT = 3; // bump when normalizeOpinion changes
+const TEXT_FORMAT = 3;
+const NUMBERED_PARA = /^(\d{1,3}\.)\s+(?=\S)/; // "12. Plaintiff alleges…" in complaints and motions // bump when normalizeOpinion changes
 
 const isHeadingLine = (k) => k.length < 90 && (
   (/[A-Z]{3}/.test(k) && k === k.toUpperCase() && !/[.;,]$/.test(k)) ||
@@ -1683,7 +1737,7 @@ const isHeadingLine = (k) => k.length < 90 && (
 const PARA_MARK = /^(\{¶\s*\d+\}|¶\s*\d+\.?|\[\d+\])\s*/;
 
 /** Turn raw opinion text (hard-wrapped lines, tabs, page headers) into clean paragraphs separated by blank lines. */
-function normalizeOpinion(raw) {
+function normalizeOpinion(raw, { numbered = false } = {}) {
   let lines = raw.replace(/\r\n?/g, '\n').replace(/[   ]/g, ' ').replace(/[​﻿]/g, '').split('\n');
   // Drop running headers/footers (short lines repeated 3+ times) and bare page numbers.
   const counts = new Map();
@@ -1709,7 +1763,7 @@ function normalizeOpinion(raw) {
     if (!l.trim()) { blank = true; continue; }
     const k = l.trim().replace(/\s+/g, ' ');
     const midSentence = cur && !(blank && FOOTNOTE.test(cur)) && (/[-–]$/.test(cur) || (!/[.:?!;"”’)\]]$/.test(cur) && /^[a-z(,;]/.test(k)));
-    const start = !cur || PARA_MARK.test(k) || isHeadingLine(k) || isHeadingLine(prev) ||
+    const start = !cur || PARA_MARK.test(k) || (numbered && NUMBERED_PARA.test(k)) || isHeadingLine(k) || isHeadingLine(prev) ||
       (!midSentence && (blank || (useIndent && indentOf(l) >= 2) ||
         (/[.:?!]["”’)]?$/.test(prev) && prev.length < median * 0.7)));
     if (start) { if (cur) paras.push(cur); cur = k; }
@@ -1775,7 +1829,7 @@ function segmentSentences(p, from = 0) {
 /** Make sure a case's text is in the clean format; remap old highlights onto it. */
 async function ensureCleanText(c) {
   if (!c.text || c.fmt === TEXT_FORMAT) return;
-  const clean = normalizeOpinion(c.text);
+  const clean = normalizeOpinion(c.text, { numbered: isFiling(c) });
   const squash = (s) => s.replace(/\s+/g, ' ').trim();
   c.annotations = (c.annotations || []).map((a) => {
     const q = squash(a.quote);
@@ -1821,7 +1875,7 @@ function renderOpinion(el, c) {
     const heading = isHeadingLine(para.trim());
     const block = h(heading ? 'h3' : 'p', { class: !heading && FOOTNOTE.test(para) && para.length < 1500 ? 'fn' : null });
     let from = 0;
-    const m = !heading && para.match(PARA_MARK);
+    const m = !heading && (para.match(PARA_MARK) || (isFiling(c) && para.match(NUMBERED_PARA)));
     if (m) { block.append(h('span', { class: 'pnum' }, m[1].replace(/[{}]/g, '').replace(/\s+/g, ''))); from = m[0].length; }
     for (const [s, e] of segmentSentences(para, from)) {
       const span = h('span', { class: 's', 'data-s': pStart + s, 'data-e': pStart + e });
@@ -2182,7 +2236,19 @@ ${CASES_JSON_RULE}` }],
 async function runSupportCheck(p, c, prop, outEl) {
   const r = await streamInto(outEl, {
     system: systemFor(p, c),
-    messages: [{ role: 'user', content: `Does this case support this point in my brief?
+    messages: [{ role: 'user', content: prop.theirs ? `The OTHER SIDE cites this case. Does it actually support their argument? Be skeptical and precise — we want to know if they're overstating it.
+
+THEIR ARGUMENT: ${prop.text}
+
+Start your answer with exactly one line: "VERDICT: strong", "VERDICT: partial", "VERDICT: weak", "VERDICT: none", or "VERDICT: against" (how well the case supports THEM; weak = only dicta or only by analogy; against = it actually helps us). Then:
+
+## The short answer
+## What the case really held — and how that compares to what they say it holds
+## Where their reading stretches the case
+(Different facts, posture, dicta, jurisdiction, later limits — step by step.)
+## Language that helps us
+(Exact quotes with star pages or ¶ numbers if shown.)
+## How to distinguish it in our response` : `Does this case support this point in my brief?
 
 MY POINT: ${prop.text}
 SECTION: ${prop.section || ''}
@@ -2443,13 +2509,26 @@ function chatTab(main, c, p, prop) {
     list.replaceChildren(...(c.chat || []).map((m) => m.role === 'user'
       ? h('div', { class: 'msg user' }, m.display || m.content)
       : h('div', { class: 'msg assistant' }, mdEl(m.content), candidateCards(p, m.cases, prop?.id, { unverified: true, title: 'Cases mentioned' }))));
-    if (!c.chat?.length) list.append(h('p', { class: 'muted' }, 'Ask anything about this case. I’ve read the whole opinion and your draft brief.'));
+    if (!c.chat?.length) list.append(h('p', { class: 'muted' }, isFiling(c) ? `Ask anything about their ${docLabel(c).toLowerCase()}. I’ve read all of it, plus your matter details and draft.` : 'Ask anything about this case. I’ve read the whole opinion and your draft brief.'));
   };
   draw();
-  const input = h('textarea', { placeholder: 'Ask about this case…', rows: 1 });
+  const input = h('textarea', { placeholder: isFiling(c) ? 'Ask about their filing…' : 'Ask about this case…', rows: 1 });
   input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; });
   const send = h('button', { class: 'btn primary', 'aria-label': 'Send' }, '↑');
-  const quick = [
+  const quick = isFiling(c) && c.docType === 'complaint' ? [
+    'Who are the parties, and who is suing whom?',
+    'What exactly do they say we did?',
+    'Which allegations are weakest or most conclusory?',
+    'What is the amount in controversy?',
+    'Can we remove this to federal court?',
+    'What should we investigate first?',
+  ] : isFiling(c) ? [
+    'What are they asking the court to do?',
+    'What is their strongest argument?',
+    'Which cases do they rely on most?',
+    'Where are they overstating the law or the facts?',
+    'How should we respond?',
+  ] : [
     'What are the key facts?',
     'What’s the holding in one sentence?',
     'How could the other side distinguish this case?',
@@ -2522,6 +2601,331 @@ function notesTab(main, c, propId) {
   }
 }
 
+/* ============================== Matter details & the other side's filings ============================== */
+
+/** Inputs for the matter details that every request sees. */
+function matterFields(p) {
+  const m = p.matter || {};
+  const served = h('input', { type: 'text', value: m.served || '', placeholder: 'e.g., November 3, 2026 (personal service)' });
+  const plans = h('textarea', { style: 'min-height:80px', placeholder: 'e.g., We plan to remove to the U.S. District Court for the Northern District of Ohio, Eastern Division (Cleveland). Then move to dismiss.' }, m.plans || '');
+  const notes = h('textarea', { style: 'min-height:80px', placeholder: 'Anything else Claude should keep in mind: our client, key facts we know, related cases, insurance, deadlines…' }, m.notes || '');
+  return {
+    el: h('div', {},
+      h('label', { class: 'f' }, 'Date we were served'), served,
+      h('label', { class: 'f' }, 'Our plans (removal, motions, strategy)'), plans,
+      h('label', { class: 'f' }, 'Other details'), notes),
+    value: () => ({ served: served.value.trim(), plans: plans.value.trim(), notes: notes.value.trim() }),
+  };
+}
+
+async function matterSheet(p, title = 'Matter details') {
+  const court = h('input', { type: 'text', value: p.court || '', placeholder: 'e.g., Cuyahoga County Court of Common Pleas' });
+  const side = h('input', { type: 'text', value: p.side || '', placeholder: 'e.g., Defendant Acme Insurance Co.' });
+  const mf = matterFields(p);
+  const ok = await sheet(title, h('div', {},
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'These details stay with this matter. Every explanation, review, research chat, and draft takes them into account. Change them any time.'),
+    h('label', { class: 'f' }, 'Where it’s filed now'), court,
+    h('label', { class: 'f' }, 'Who we represent'), side,
+    mf.el), [{ label: 'Save', run: () => true }]);
+  if (!ok) return false;
+  const fresh = await db.get('projects', p.id);
+  Object.assign(fresh, { court: court.value.trim(), side: side.value.trim(), matter: mf.value() });
+  await save('projects', fresh);
+  Object.assign(p, fresh);
+  return true;
+}
+
+function matterCard(p) {
+  const m = p.matter || {};
+  const rows = [
+    ['Filed in', p.court], ['We represent', p.side], ['Served', m.served], ['Our plans', m.plans], ['Other details', m.notes],
+  ].filter(([, v]) => v);
+  return h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('h3', { class: 'grow', style: 'margin:0' }, 'Matter details'), h('button', { class: 'btn slim', onclick: async () => { if (await matterSheet(p)) route(); } }, rows.length ? '✎ Edit' : '＋ Add')),
+    rows.length
+      ? h('dl', { class: 'matter' }, rows.flatMap(([k, v]) => [h('dt', {}, k), h('dd', {}, v)]))
+      : h('p', { class: 'small muted', style: 'margin:6px 0 0' }, 'Tell Claude where the case is, who you represent, when you were served, and your plans (for example, removing to federal court). Every review and answer will account for it.'));
+}
+
+/** The other side's filings, for research chat and drafting context. */
+async function filingsBlock(p) {
+  const fs = (await projectFilings(p.id)).filter((f) => f.text);
+  if (!fs.length) return [];
+  const text = 'THE OTHER SIDE’S FILINGS IN THIS MATTER (full text):\n\n' + fs.map((f) => `<filing id="${f.id}" type="${docLabel(f)}" name="${f.name}">\n${f.text}\n</filing>`).join('\n\n');
+  return [{ type: 'text', text, cache_control: { type: 'ephemeral' } }];
+}
+
+function filingPicker() {
+  const state = { text: '', fileName: '' };
+  const status = h('div', { class: 'small muted' });
+  const input = h('input', { type: 'file', accept: '.pdf,.docx,.txt,.md' });
+  input.addEventListener('change', async () => {
+    const f = input.files[0];
+    if (!f) return;
+    status.textContent = 'Reading ' + f.name + '…';
+    try {
+      state.text = await fileToText(f);
+      state.fileName = f.name;
+      status.textContent = `✓ ${f.name} (${Math.round(state.text.length / 1000)}k characters)`;
+    } catch (e) { status.textContent = '⚠️ ' + e.message; }
+  });
+  const paste = h('textarea', { placeholder: 'Or paste the text here…' });
+  paste.addEventListener('input', () => { state.text = paste.value; state.fileName = ''; });
+  const type = h('select', {}, Object.entries(DOC_TYPES).map(([k, v]) => h('option', { value: k }, v)));
+  const name = h('input', { type: 'text', placeholder: 'e.g., Smith’s Complaint (filed Oct. 28, 2026)' });
+  return {
+    el: h('div', {},
+      h('label', { class: 'f' }, 'What is it?'), type,
+      h('label', { class: 'f' }, 'Name (optional)'), name,
+      h('label', { class: 'file', style: 'margin-top:12px' }, input, '📎 Upload it (PDF, Word, or text)'), status,
+      h('label', { class: 'f' }, 'Paste instead'), paste),
+    state,
+    value: (matterName) => ({ docType: type.value, name: name.value.trim() || (matterName ? `${DOC_TYPES[type.value]} — ${matterName}` : `${DOC_TYPES[type.value]}${state.fileName ? ` (${state.fileName.replace(/\.\w+$/, '')})` : ''}`), text: state.text.trim() }),
+  };
+}
+
+async function createFiling(p, v) {
+  const c = newCase(p.id, { name: v.name });
+  Object.assign(c, { kind: 'filing', docType: v.docType, text: v.text, source: 'Uploaded' });
+  await save('cases', c);
+  return c;
+}
+
+async function addFilingSheet(p) {
+  const fp = filingPicker();
+  const v = await sheet('Add the other side’s filing', fp.el, [{ label: 'Add', run: () => (fp.state.text.trim() ? fp.value(p.name) : (toast('Upload a file or paste the text'), false)) }]);
+  if (!v) return;
+  const c = await createFiling(p, v);
+  if (!p.matter?.plans && !p.matter?.served) await matterSheet(p, 'A few details first (optional)');
+  go(`#/c/${c.id}?tab=breakdown&run=1`);
+}
+
+/** From the home screen: a new matter that starts with their complaint or motion. */
+async function newFilingProjectSheet() {
+  const name = h('input', { type: 'text', placeholder: 'e.g., Smith v. Acme' });
+  const court = h('input', { type: 'text', placeholder: 'e.g., Cuyahoga County Court of Common Pleas' });
+  const side = h('input', { type: 'text', value: 'Defendant' });
+  const fp = filingPicker();
+  const blank = { matter: {} };
+  const mf = matterFields(blank);
+  const res = await sheet('Review the other side’s filing', h('div', {},
+    h('label', { class: 'f' }, 'Matter name'), name,
+    h('label', { class: 'f' }, 'Where it’s filed'), court,
+    h('label', { class: 'f' }, 'Who we represent'), side,
+    fp.el,
+    h('details', { style: 'margin-top:12px' }, h('summary', {}, 'Matter details (served date, plans like removal)'), mf.el)),
+  [{ label: 'Start review', run: () => (fp.state.text.trim() ? true : (toast('Upload the filing or paste its text'), false)) }]);
+  if (!res) return;
+  const v = fp.value(name.value.trim());
+  const p = { id: uid(), name: name.value.trim() || v.name || 'New matter', court: court.value.trim(), side: side.value.trim(), matter: mf.value(), draft: '', props: [], createdAt: Date.now() };
+  await save('projects', p);
+  const c = await createFiling(p, v);
+  go(`#/c/${c.id}?tab=breakdown&run=1`);
+}
+
+async function filingsTab(main, p) {
+  const filings = (await projectFilings(p.id)).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  main.append(matterCard(p),
+    h('button', { class: 'btn primary big', onclick: () => addFilingSheet(p) }, '＋ Add the other side’s filing'));
+  if (!filings.length) {
+    main.append(h('p', { class: 'muted' }, 'Upload their complaint, motion, or brief. I’ll give you a lawyer’s review of it, answer your questions about it, and help you research and draft the response.'));
+    return;
+  }
+  const theirs = (p.props || []).filter((x) => x.theirs);
+  for (const f of filings) {
+    const n = theirs.filter((x) => x.filingId === f.id).length;
+    main.append(h('div', { class: 'card tap', onclick: () => go(`#/c/${f.id}?tab=${f.breakdown ? 'breakdown' : 'read'}`) },
+      h('div', { class: 'row', style: 'flex-wrap:nowrap; align-items:flex-start' },
+        h('h3', { class: 'grow' }, f.name),
+        h('button', { class: 'iconbtn', 'aria-label': 'Delete filing', style: 'font-size:17px; margin:-6px -8px 0 0', onclick: (e) => { e.stopPropagation(); deleteCase(f); } }, '🗑')),
+      h('div', { class: 'row small', style: 'margin-top:4px' },
+        h('span', { class: 'badge' }, docLabel(f)),
+        f.breakdown ? h('span', { class: 'badge ok' }, '✓ Reviewed') : h('span', { class: 'badge' }, 'Not reviewed yet'),
+        n ? h('span', { class: 'badge bad' }, `${n} arguments mapped`) : null,
+        f.annotations?.length ? h('span', { class: 'muted' }, `${f.annotations.length} highlights`) : null)));
+  }
+}
+
+/* ---- Reviewing a filing ---- */
+
+function filingReviewPrompt(p, c) {
+  const deadlines = '(Say what each deadline runs from and what rule sets it, and tell me to verify it against the rules and the actual service date — never state a calendar date as certain.)';
+  if (c.docType === 'complaint') {
+    return `Review this complaint for me the way defense counsel would on a first careful read. Account for my matter details (where it's filed, when we were served, and our plans). Use exactly these sections:
+
+## The big picture
+(3–4 sentences: who is suing whom, for what, and how serious it looks.)
+## The parties
+(Each party, how they're described, and their role. Include citizenship / state of incorporation / principal place of business as alleged — and say plainly when it is NOT alleged.)
+## The story they tell
+(The key facts they allege, in order, with ¶ numbers. Separate actual factual allegations from labels, conclusions, and characterizations.)
+## Their claims, count by count
+(For each count: the legal theory in plain English; the elements they must prove; which allegations (¶) go to each element; where the allegations are thin, conclusory, or missing.)
+## What they want
+(Relief requested, any dollar amounts, fees, punitive damages, jury demand, and what that means for the amount in controversy.)
+## Legal issues this raises
+(Statutes, doctrines, and terms of art, each explained simply.)
+## Our possible defenses and arguments
+(Motions to dismiss, affirmative defenses, and factual disputes — strongest first, with the reason each could work and what it would take.)
+## Jurisdiction, venue, and removal
+(Subject-matter jurisdiction basis; diversity — citizenship of every party and amount in controversy; federal-question hooks; forum-defendant rule; consent of co-defendants; the 30-day removal clock; the right federal district and division. Tailor this to my plans.)
+## Deadlines to calendar
+${deadlines}
+## Questions to investigate and documents to gather
+## Terms, defined
+
+${MENTIONED_RULE}`;
+  }
+  if (c.docType === 'motion' || c.docType === 'brief') {
+    return `Review this ${docLabel(c).toLowerCase()} from the other side the way opposing counsel would on a first careful read. Account for my matter details. Use exactly these sections:
+
+## The big picture
+(What they're asking the court to do, under what rule or standard, and their core theory in 3–4 sentences.)
+## Their arguments, one by one
+(For each argument: the proposition, the authority they cite for it, their logic step by step, and how strong it looks.)
+## The cases they rely on
+(Each key case: what they say it holds, and anything that makes you suspect they overstate it or that I should pull and check.)
+## Weak spots
+(Overstatements, missing elements, facts outside the record or the pleadings, the wrong legal standard, cases that may not say what they claim.)
+## How we respond
+(Our strongest responses first, and what authority we need for each.)
+## Deadlines
+${deadlines}
+## Terms, defined
+
+${MENTIONED_RULE} List every case they cite in that json block (with citations as they give them), so I can pull and check each one.`;
+  }
+  return `Review this filing from the other side for me. Account for my matter details. Use these sections: ## The big picture ## What they say, step by step (with ¶ or page references) ## What they want ## Legal issues it raises ## Weak spots and our responses ## Deadlines ${deadlines} ## Terms, defined\n\n${MENTIONED_RULE}`;
+}
+
+async function filingReviewTab(main, c, p) {
+  const out = h('div', { class: 'md' });
+  const cards = h('div', {}, candidateCards(p, c.mentioned, null, { unverified: true, title: c.docType === 'complaint' ? 'Cases and authorities mentioned' : 'Cases they cite' }));
+  const btn = h('button', { class: 'btn primary big', onclick: run }, c.breakdown ? '↻ Redo the review' : `🧠 Review this ${docLabel(c).toLowerCase()}`);
+  const intro = h('p', { class: 'muted', style: 'margin-top:0' }, c.docType === 'complaint'
+    ? 'A full first-read review: the parties, the facts they allege (with ¶ cites), each count element by element, what they want, our defenses, jurisdiction and removal, and deadlines.'
+    : 'A full review: their arguments one by one, the cases they rely on, weak spots, and how we respond.');
+  main.append(matterCardMini(p), h('div', { class: 'card' }, c.breakdown ? out : intro, c.breakdown ? null : out, cards), btn);
+  if (c.breakdown) out.innerHTML = md(c.breakdown);
+
+  // Next steps after the review
+  const next = h('div', { class: 'card', style: c.breakdown ? '' : 'display:none' });
+  const mapped = (p.props || []).filter((x) => x.filingId === c.id);
+  if (c.docType === 'complaint') {
+    next.append(h('h3', {}, 'Next steps'),
+      h('p', { class: 'small muted', style: 'margin-top:0' }, 'Turn the defenses from the review into research points. Each point gets case research, support checks, and a drafted paragraph.'),
+      h('button', { class: 'btn big', onclick: (e) => defensesToPoints(p, c, e.currentTarget) }, c.defensesAdded ? '➕ Add the defenses as points again' : '➕ Turn our defenses into research points'));
+  } else {
+    next.append(h('h3', {}, 'Their arguments'),
+      h('p', { class: 'small muted', style: 'margin-top:0' }, 'Map each of their arguments and the cases they cite for it. Then, for each one, check whether their cases really support it and find cases that cut against it.'),
+      h('button', { class: 'btn big', onclick: (e) => mapFilingArguments(p, c, e.currentTarget) }, mapped.length ? `🧭 Map again (${mapped.length} mapped)` : '🧭 Map their arguments and cases'),
+      mapped.length ? h('button', { class: 'btn slim', style: 'margin-top:8px', onclick: () => go(`#/p/${p.id}?tab=points`) }, 'See them in Points →') : null);
+  }
+  next.append(h('button', { class: 'btn slim', style: 'margin-top:8px', onclick: () => go(`#/p/${p.id}?tab=research`) }, '💬 Research chat (sees this filing)'));
+  main.append(next);
+
+  async function run() {
+    const done = busy(btn, 'Reviewing… (1–3 minutes)');
+    if (!out.isConnected) main.querySelectorAll('.card')[1].replaceChildren(out, cards);
+    cards.replaceChildren();
+    try {
+      const r = await streamInto(out, { system: systemFor(p, c), messages: [{ role: 'user', content: filingReviewPrompt(p, c) }], maxTokens: 48000 });
+      c.mentioned = lastJSON(r.text)?.cases || [];
+      c.breakdown = stripJSONBlocks(r.text).trim();
+      await save('cases', c);
+      out.innerHTML = md(c.breakdown);
+      cards.replaceChildren(candidateCards(p, c.mentioned, null, { unverified: true, title: c.docType === 'complaint' ? 'Cases and authorities mentioned' : 'Cases they cite' }));
+      next.style.display = '';
+    } catch {}
+    done();
+    btn.textContent = '↻ Redo the review';
+  }
+  if (new URLSearchParams(location.hash.split('?')[1]).get('run') === '1' && !c.breakdown) {
+    history.replaceState(null, '', `#/c/${c.id}?tab=breakdown`);
+    run();
+  }
+}
+
+function matterCardMini(p) {
+  const bits = [p.court, p.side ? `we represent ${p.side}` : null, p.matter?.served ? `served ${p.matter.served}` : null].filter(Boolean);
+  return h('div', { class: 'banner small' },
+    bits.length ? bits.join(' · ') : 'No matter details yet.',
+    p.matter?.plans ? h('div', {}, h('strong', {}, 'Plans: '), p.matter.plans) : null,
+    h('div', {}, h('a', { href: '#', onclick: async (e) => { e.preventDefault(); if (await matterSheet(p)) route(); } }, bits.length || p.matter?.plans ? 'Edit matter details' : 'Add matter details (where it’s filed, served date, removal plans)')));
+}
+
+/** Their motion/brief → "their argument" points, with the cases they cite linked for checking. */
+async function mapFilingArguments(p, c, btn) {
+  const done = busy(btn, 'Mapping their arguments…');
+  try {
+    const parts = splitDraft(c.text);
+    const results = [];
+    const system = [
+      { type: 'text', text: 'You are a meticulous litigation associate mapping the other side’s filing into its legal building blocks.' },
+      { type: 'text', text: `THE OTHER SIDE'S FULL ${docLabel(c).toUpperCase()} (for context):\n<document>\n${c.text}\n</document>`, cache_control: { type: 'ephemeral' } },
+    ];
+    for (let i = 0; i < parts.length; i++) {
+      btn.innerHTML = `<span class="spin"></span> Part ${i + 1} of ${parts.length}…`;
+      const r = await claude({
+        system,
+        messages: [{ role: 'user', content: `Go through EXCERPT ${i + 1} of ${parts.length} of the other side's filing (below) and list each distinct legal ARGUMENT or proposition they make. Use the full filing above only for context. Only list arguments whose main statement is inside this excerpt.
+
+For each: section = their heading it falls under; text = their proposition in one or two plain sentences, faithful to what they wrote; kind = "cited" if they cite case law for it, else "research_needed"; bracket = ""; citations = every CASE they cite for it (case name, full citation, pincite), short cites resolved. Skip statutes and rules. Return an empty list for captions, signature blocks, and certificates.
+
+<excerpt>
+${parts[i]}
+</excerpt>` }],
+        format: { type: 'json_schema', schema: PROPS_SCHEMA },
+        maxTokens: 32000,
+        effort: 'low',
+      });
+      results.push(JSON.parse(r.text));
+    }
+    const fresh = await db.get('projects', p.id);
+    const keep = (fresh.props || []).filter((x) => x.filingId !== c.id);
+    const props = results.flatMap((d) => d.propositions).map((x) => ({ id: uid(), section: x.section, text: x.text, kind: x.kind, bracket: '', citations: x.citations, caseIds: [], theirs: true, filingId: c.id }));
+    for (const prop of props) {
+      for (const cit of prop.citations) {
+        if (!cit.citation && !cit.case_name) continue;
+        const cc = await findOrCreateCase(fresh, cit);
+        if (!prop.caseIds.includes(cc.id)) prop.caseIds.push(cc.id);
+      }
+    }
+    fresh.props = [...keep, ...props];
+    await save('projects', fresh);
+    toast(`Mapped ${props.length} of their arguments`);
+    go(`#/p/${p.id}?tab=points`);
+  } catch (e) {
+    toast('⚠️ ' + friendlyError(e), 6000);
+    done();
+  }
+}
+
+/** Complaint review → our defense points to research. */
+async function defensesToPoints(p, c, btn) {
+  const done = busy(btn, 'Pulling out the defenses…');
+  try {
+    const r = await claude({
+      system: systemFor(p, c),
+      messages: [{ role: 'user', content: `Here is your review of this complaint:\n<review>\n${c.breakdown}\n</review>\n\nList our defenses and arguments as research points: each one a legal proposition we would need authority for (for example, "A breach-of-contract claim must identify the specific contract provision breached." or "A non-party to an insurance policy lacks standing to sue on it."). Group them by the count or issue they answer (section). Strongest first. Include jurisdiction/removal propositions only if they need legal authority.` }],
+      format: { type: 'json_schema', schema: { type: 'object', additionalProperties: false, required: ['points'], properties: { points: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['section', 'text'], properties: { section: { type: 'string' }, text: { type: 'string' } } } } } } },
+      maxTokens: 16000,
+      effort: 'low',
+    });
+    const pts = JSON.parse(r.text).points || [];
+    const fresh = await db.get('projects', p.id);
+    fresh.props = [...(fresh.props || []), ...pts.map((x) => ({ id: uid(), section: x.section, text: x.text, kind: 'research_needed', bracket: '', citations: [], caseIds: [], fromFilingId: c.id }))];
+    await save('projects', fresh);
+    c.defensesAdded = true;
+    await save('cases', c);
+    toast(`Added ${pts.length} defense points`);
+    go(`#/p/${p.id}?tab=points`);
+  } catch (e) {
+    toast('⚠️ ' + friendlyError(e), 6000);
+    done();
+  }
+}
+
 /* ============================== Brief-writing manual ============================== */
 
 let MANUAL = null; // { key:'manual', name, text, at }
@@ -2591,7 +2995,7 @@ function researchFile(p, cases) {
     for (const x of props) {
       const cs = (x.caseIds || []).map((id) => cases.find((c) => c.id === id)).filter(Boolean)
         .map((c) => `${c.id} (${caseTitle(c)}${c.support?.[x.id]?.verdict ? ', support check: ' + c.support[x.id].verdict : ''})`);
-      L.push(`<point id="${x.id}" section="${x.section || ''}"${x.kind === 'research_needed' ? ' needs_research="yes"' : ''}>`);
+      L.push(`<point id="${x.id}" section="${x.section || ''}"${x.theirs ? ' whose="THE OTHER SIDE’S ARGUMENT (we answer it)"' : ''}${!x.theirs && x.kind === 'research_needed' ? ' needs_research="yes"' : ''}>`);
       L.push(x.text);
       if (x.bracket) L.push(`My research note: ${x.bracket}`);
       if (cs.length) L.push(`Cases for this point: ${cs.join('; ')}`);
@@ -2671,10 +3075,11 @@ function caseTool(cases) {
 
 async function draftSystem(p, cases) {
   await loadManual();
-  const blocks = [{ type: 'text', text: DRAFT_RULES + `\n\nPROJECT: ${p.name}\nCOURT / JURISDICTION: ${p.court || 'not specified'}\nOUR SIDE: ${p.side || 'not specified'}` }];
+  const blocks = [{ type: 'text', text: DRAFT_RULES + `\n\nPROJECT: ${p.name}\nCOURT / JURISDICTION: ${p.court || 'not specified'}\nOUR SIDE: ${p.side || 'not specified'}${matterText(p) ? '\n' + matterText(p) : ''}` }];
   const m = manualBlock();
   if (m) blocks.push(m);
   blocks.push({ type: 'text', text: researchFile(p, cases), cache_control: { type: 'ephemeral' } });
+  blocks.push(...(await filingsBlock(p)));
   return blocks;
 }
 
@@ -3099,7 +3504,7 @@ async function savedTab(main, c, p, propId) {
   const props = p.props || [];
   const section = (title, count, body) => h('details', { class: 'card' }, h('summary', {}, `${title}${count != null ? ` (${count})` : ''}`), body);
   const items = [];
-  if (c.breakdown) items.push(section('Break it down', null, h('div', {}, c.rec ? recBadge(c.rec.value) : null, mdEl(c.breakdown))));
+  if (c.breakdown) items.push(section(isFiling(c) ? 'Review' : 'Break it down', null, h('div', {}, c.rec ? recBadge(c.rec.value) : null, mdEl(c.breakdown))));
   const sup = Object.entries(c.support || {});
   if (sup.length) items.push(section('Support checks', sup.length, h('div', {}, sup.map(([pid, s]) => h('div', { style: 'margin-top:10px' }, h('div', { class: 'small muted' }, props.find((x) => x.id === pid)?.text || 'Point'), verdictBadge(s.verdict), mdEl(s.text))))));
   const cmp = Object.entries(c.compare || {});

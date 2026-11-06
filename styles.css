@@ -286,3 +286,9 @@ body[data-reading="night"] .propbar { background: #2a2416; border-color: #4a3d20
 .redline .rl-add, .redline .rl-del { border-left: 3px solid var(--line); padding-left: .6em; }
 .redline .skipnote { text-align: center; font: 13px -apple-system, sans-serif; color: var(--rmuted); }
 a.btn { text-decoration: none; }
+
+/* Matter details + the other side's filings */
+dl.matter { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 10px 0 0; font-size: 14.5px; }
+dl.matter dt { color: var(--muted); }
+dl.matter dd { margin: 0; white-space: pre-wrap; }
+.section-title.theirs { color: var(--bad); }

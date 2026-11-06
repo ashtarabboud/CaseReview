@@ -13,6 +13,14 @@ A phone-friendly app for reading and understanding case law, built around your d
 
 The instructions for how things get explained are built in, and you can edit them under **Settings → How to explain things to me**.
 
+## The other side's filings (complaints, motions, briefs)
+
+- **Home → Review a complaint or the other side's filing**, or a project's **Their filings** tab. Upload their filing (PDF, Word, or text).
+- **Matter details** (where it's filed, who you represent, date served, plans such as removal to a specific federal court, anything else) stay with the matter, and every review, answer, research chat, and draft accounts for them.
+- **Review it:** for a complaint, you get the parties (including whether citizenship is alleged), the facts with ¶ cites, each count element by element, what they want, our defenses, jurisdiction/venue/removal, deadlines to verify, and what to investigate. For a motion or brief, you get their arguments one by one, the cases they rely on, weak spots, and how to respond.
+- **Ask** anything about it. The reader shows their numbered paragraphs, and tap-to-highlight works.
+- **Complaints:** turn the defenses into research points. **Motions:** map their arguments into points. For each one, check whether their cases really support it, find cases that cut against it, and write your response paragraph.
+
 ## Drafting and review
 
 - **Your brief-writing manual** (Settings → Brief-writing manual): upload it once. Every drafting and revision request includes it, as does "Write the paragraph."
