@@ -9,7 +9,7 @@ import { extractDocxBlocks, buildDocx } from './shared/docx.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '16';
+const APP_VERSION = '17';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -134,6 +134,7 @@ function friendlyError(e) {
   if (e instanceof NeedKey) return 'Add your Claude API key in Settings first.';
   const s = e?.status;
   if (s === 401) return 'Your Claude API key was rejected. Check it in Settings.';
+  if (s === 400 && /prompt is too long/i.test(e?.message || '')) return 'This request is bigger than Claude can take in at once (1 million tokens). Tell me where it happened — the app should be trimming it to fit.';
   if (s === 403) return 'Your API key doesn’t have permission for this (403).';
   if (s === 429) return 'Rate limit hit — wait a minute and try again. (Or raise your limits in the Claude Console.)';
   if (s === 529 || s === 503) return 'Claude is overloaded right now. Try again in a moment.';
@@ -2566,10 +2567,16 @@ function supportTab(main, c, p, prop) {
 function otherCasesBlock(c, prop, cases) {
   const others = (prop.caseIds || []).filter((id) => id !== c.id).map((id) => cases.find((x) => x.id === id)).filter(Boolean);
   if (!others.length) return { others, block: null };
-  const text = 'MY OTHER CASES FOR THIS POINT (full text where I have pulled it):\n\n' + others.map((x) => {
+  // Strongest cases first; full opinions until a size budget, then just my saved support check.
+  const rank = { strong: 0, partial: 1, weak: 2, undefined: 3, none: 4, against: 5 };
+  const ordered = [...others].sort((a, b) => (rank[a.support?.[prop.id]?.verdict] ?? 3) - (rank[b.support?.[prop.id]?.verdict] ?? 3));
+  let room = 1500000; // characters (~470k tokens) so the whole request stays under Claude's limit
+  const text = 'MY OTHER CASES FOR THIS POINT (full text where I have pulled it and there is room; otherwise my saved support check):\n\n' + ordered.map((x) => {
     const sup = x.support?.[prop.id];
     const head = `### ${caseTitle(x)}${x.citation ? ', ' + x.citation : ''}${sup?.verdict ? ` — my support check: ${sup.verdict}` : ''}${x.rec?.propId === prop.id ? ` — recommendation: ${x.rec.value}` : ''}`;
-    return x.text ? `${head}\n<opinion>\n${x.text}\n</opinion>` : `${head}\n(Not pulled yet — I only have its name and citation.)`;
+    if (x.text && x.text.length <= room) { room -= x.text.length; return `${head}\n<opinion>\n${x.text}\n</opinion>`; }
+    if (sup?.text) { room -= Math.min(room, sup.text.length); return `${head}\n(Full opinion left out to fit the size limit. My saved support check:)\n${sup.text}`; }
+    return x.text ? `${head}\n(Full opinion left out to fit the size limit.)` : `${head}\n(Not pulled yet — I only have its name and citation.)`;
   }).join('\n\n');
   return { others, block: { type: 'text', text, cache_control: { type: 'ephemeral' } } };
 }
@@ -2898,9 +2905,14 @@ function matterCard(p) {
 }
 
 /** The other side's filings, for research chat and drafting context. */
-async function filingsBlock(p) {
+async function filingsBlock(p, { mode = 'auto', maxChars = 1200000 } = {}) {
   const fs = (await projectFilings(p.id)).filter((f) => f.text);
   if (!fs.length) return [];
+  const total = fs.reduce((n, f) => n + f.text.length, 0);
+  if (mode === 'index' || (mode === 'auto' && total > maxChars)) {
+    const text = 'THE OTHER SIDE’S FILINGS IN THIS MATTER (too large to include in full — open one with read_filing if you need it):\n' + fs.map((f) => `<filing id="${f.id}" type="${docLabel(f)}" name="${f.name}" length="${Math.round(f.text.length / 1000)}k characters">${f.breakdown ? '\n' + cap(mdSection(f.breakdown, 'The big picture') || f.breakdown, 1500) + '\n' : ''}</filing>`).join('\n');
+    return [{ type: 'text', text, cache_control: { type: 'ephemeral' } }];
+  }
   const text = 'THE OTHER SIDE’S FILINGS IN THIS MATTER (full text):\n\n' + fs.map((f) => `<filing id="${f.id}" type="${docLabel(f)}" name="${f.name}">\n${f.text}\n</filing>`).join('\n\n');
   return [{ type: 'text', text, cache_control: { type: 'ephemeral' } }];
 }
@@ -3236,9 +3248,31 @@ function manualCard() {
 
 const cap = (t, n) => (t && t.length > n ? t.slice(0, n) + '…' : t || '');
 
-/** Everything already worked out for this project, as one document Claude can build on. */
-function researchFile(p, cases) {
-  const L = ['MY RESEARCH FILE — the analyses I have already run. They are settled work: build on them; do not redo them.', ''];
+/** A "## Heading" section of a Markdown analysis (up to the next heading of the same or higher level). */
+function mdSection(text, name) {
+  const lines = String(text || '').split('\n');
+  const i = lines.findIndex((l) => /^#{2,3}\s/.test(l) && l.replace(/^#+\s*/, '').toLowerCase().startsWith(name.toLowerCase()));
+  if (i < 0) return '';
+  const level = lines[i].match(/^#+/)[0].length;
+  let j = i + 1;
+  while (j < lines.length && !(new RegExp(`^#{1,${level}}\\s`).test(lines[j]))) j++;
+  return lines.slice(i + 1, j).join('\n').trim();
+}
+
+const CHARS_PER_TOKEN = 3.2; // conservative for legal text
+const estTokens = (t) => Math.ceil(String(t || '').length / CHARS_PER_TOKEN);
+const DRAFT_BUDGET_TOKENS = 560000; // system + brief; leaves room for cases Claude opens and for its answer (limit is 1,000,000)
+const HL = { yellow: 'important', green: 'helps us', red: 'hurts us', blue: 'the rule' };
+
+/**
+ * Everything already worked out for this project, as one document Claude can build on.
+ * level 0 = full analyses; 1 = compact summaries; 2 = index only. Levels 1–2 are used when the full
+ * file wouldn't fit — Claude then opens any full analysis with read_saved_analysis.
+ */
+function researchFile(p, cases, level = 0) {
+  const L = [level === 0
+    ? 'MY RESEARCH FILE — the analyses I have already run. They are settled work: build on them; do not redo them.'
+    : `MY RESEARCH FILE (${level === 1 ? 'SUMMARY' : 'INDEX'}) — my full research is too large to send at once, so this is a ${level === 1 ? 'summary' : 'list'}. The full saved analyses are settled work: open any of them with read_saved_analysis (case_id, kind, point_id) before relying on details, and open an opinion with read_case_text. Do not redo analyses.`, ''];
   const props = p.props || [];
   if (props.length) {
     L.push('POINTS IN MY BRIEF:');
@@ -3249,27 +3283,43 @@ function researchFile(p, cases) {
       L.push(x.text);
       if (x.bracket) L.push(`My research note: ${x.bracket}`);
       if (cs.length) L.push(`Cases for this point: ${cs.join('; ')}`);
-      if (x.synthesis) L.push(`<comparison_of_cases>\n${x.synthesis}\n</comparison_of_cases>`);
+      if (x.synthesis) L.push(`<comparison_of_cases>\n${level === 0 ? x.synthesis : cap(x.synthesis, level === 1 ? 2500 : 600)}\n</comparison_of_cases>`);
       if (x.paragraph) L.push(`<paragraph_written_for_this_point>\n${x.paragraph}\n</paragraph_written_for_this_point>`);
       L.push('</point>', '');
     }
   }
   const relevant = cases.filter((c) => c.text || c.breakdown || Object.keys(c.support || {}).length || props.some((x) => (x.caseIds || []).includes(c.id)));
-  if (relevant.length) L.push('CASES (use the id with read_case_text to open the full opinion):');
+  if (relevant.length) L.push('CASES (use the id with read_case_text to open the full opinion' + (level ? ', and with read_saved_analysis to open a full analysis' : '') + '):');
   for (const c of relevant) {
     const pts = props.filter((x) => (x.caseIds || []).includes(c.id)).map((x) => x.id).join(',');
-    L.push(`<case id="${c.id}" name="${caseTitle(c)}" citation="${c.citation || ''}" court="${c.court || ''}" year="${c.year || ''}" full_text_available="${c.text ? 'yes' : 'no'}" points="${pts}">`);
+    const verdicts = Object.entries(c.support || {}).map(([pid, sp]) => `${pid}:${sp.verdict || '?'}`).join(',');
+    const attrs = `id="${c.id}" name="${caseTitle(c)}" citation="${c.citation || ''}" court="${c.court || ''}" year="${c.year || ''}" full_text_available="${c.text ? 'yes' : 'no'}" points="${pts}"`;
+    const unhelpful = Object.values(c.support || {}).length && Object.values(c.support).every((sp) => ['none', 'against'].includes(sp.verdict));
+    if (level === 2 || (level === 1 && unhelpful)) {
+      L.push(`<case ${attrs} verdicts="${verdicts}"${c.rec?.value ? ` recommendation="${c.rec.value}"` : ''}${unhelpful ? ' note="does not support any of my points"' : ''}/>`);
+      continue;
+    }
+    L.push(`<case ${attrs}>`);
     if (c.rec?.value) L.push(`Recommendation from my breakdown: ${c.rec.value}`);
-    if (c.breakdown) L.push(`<breakdown>\n${c.breakdown}\n</breakdown>`);
-    for (const [pid, sp] of Object.entries(c.support || {})) L.push(`<support point="${pid}" verdict="${sp.verdict || ''}">\n${sp.text}\n</support>`);
-    for (const [pid, cm] of Object.entries(c.compare || {})) L.push(`<compare point="${pid}">\n${cm.text}\n</compare>`);
-    for (const [pid, g] of Object.entries(c.compareResearch || {})) L.push(`<gap_research point="${pid}">\n${g.text}\n</gap_research>`);
-    if (c.better?.text) L.push(`<better_case_search>\n${c.better.text}\n</better_case_search>`);
-    const notes = (c.annotations || []).map((a) => `- [${({ yellow: 'important', green: 'helps us', red: 'hurts us', blue: 'the rule' })[a.color] || a.color}] “${cap(a.quote, 500)}”${a.note ? ` — my note: ${a.note}` : ''}`);
+    if (level === 0) {
+      if (c.breakdown) L.push(`<breakdown>\n${c.breakdown}\n</breakdown>`);
+      for (const [pid, sp] of Object.entries(c.support || {})) L.push(`<support point="${pid}" verdict="${sp.verdict || ''}">\n${sp.text}\n</support>`);
+      for (const [pid, cm] of Object.entries(c.compare || {})) L.push(`<compare point="${pid}">\n${cm.text}\n</compare>`);
+      for (const [pid, g] of Object.entries(c.compareResearch || {})) L.push(`<gap_research point="${pid}">\n${g.text}\n</gap_research>`);
+      if (c.better?.text) L.push(`<better_case_search>\n${c.better.text}\n</better_case_search>`);
+    } else {
+      if (c.breakdown) L.push(`<breakdown_summary>\n${cap(mdSection(c.breakdown, 'Should we use') || mdSection(c.breakdown, 'The bottom line') || c.breakdown, 1800)}\n</breakdown_summary>`);
+      for (const [pid, sp] of Object.entries(c.support || {})) L.push(`<support_summary point="${pid}" verdict="${sp.verdict || ''}">\n${cap(mdSection(sp.text, 'The short answer') || mdSection(sp.text, 'Why') || sp.text, 700)}\n</support_summary>`);
+      const more = [Object.keys(c.compare || {}).length && 'compare', Object.keys(c.compareResearch || {}).length && 'gaps', c.better?.text && 'better', (c.chat || []).length && 'chat'].filter(Boolean);
+      if (more.length) L.push(`(Also saved, open with read_saved_analysis: ${more.join(', ')})`);
+    }
+    const notes = (c.annotations || []).slice(0, level === 0 ? 999 : 12).map((a) => `- [${HL[a.color] || a.color}] “${cap(a.quote, level === 0 ? 500 : 300)}”${a.note ? ` — my note: ${a.note}` : ''}`);
     if (notes.length) L.push(`<my_highlights>\n${notes.join('\n')}\n</my_highlights>`);
-    const qa = [];
-    for (let i = 0; i + 1 < (c.chat || []).length; i += 2) qa.push(`Q: ${cap(c.chat[i].display || c.chat[i].content, 300)}\nA: ${cap(c.chat[i + 1].content, 1500)}`);
-    if (qa.length) L.push(`<ask_chat>\n${qa.slice(-6).join('\n\n')}\n</ask_chat>`);
+    if (level === 0) {
+      const qa = [];
+      for (let i = 0; i + 1 < (c.chat || []).length; i += 2) qa.push(`Q: ${cap(c.chat[i].display || c.chat[i].content, 300)}\nA: ${cap(c.chat[i + 1].content, 1500)}`);
+      if (qa.length) L.push(`<ask_chat>\n${qa.slice(-6).join('\n\n')}\n</ask_chat>`);
+    }
     L.push('</case>', '');
   }
   return L.join('\n');
@@ -3279,7 +3329,7 @@ const DRAFT_RULES = `You are drafting and revising a legal brief with me, inside
 
 1. Follow my brief-writing manual (below) for every word you write: voice, sentence structure, paragraph construction, tone, citations, punctuation, formatting. My explicit instructions in a request override the manual.
 2. Consider the WHOLE brief every time, not just the part you are changing. Keep terms, defined names, party names, and record citations consistent. Use a full citation the first time a case appears in the brief and short forms after (check the whole brief to see what is already cited). Don't repeat what another section already says. Make every paragraph serve the overall argument, and keep transitions and cross-references accurate.
-3. Build on my research file. My saved analyses (breakdowns, support checks, comparisons, gap research, highlights) are settled work — rely on them instead of re-analyzing. Use the read_case_text tool only to confirm a quotation or pin cite, or when the saved analyses don't cover what you need. Never redo an analysis unless I ask.
+3. Build on my research file. My saved analyses (breakdowns, support checks, comparisons, gap research, highlights) are settled work — rely on them instead of re-analyzing. Use the read_case_text tool only to confirm a quotation or pin cite, or when the saved analyses don't cover what you need. If the research file is a summary, open the full saved analysis with read_saved_analysis before relying on its details, and open the other side's filings with read_filing when they aren't included in full. Open only what you need. Never redo an analysis unless I ask.
 4. Never invent cases, quotations, holdings, pin cites, record cites, or facts. If something is missing, write a bracketed placeholder such as [cite], [pin], or [confirm holding].
 5. Track sources: every sentence you write or change that relies on a case must be listed in "sources" with the case id and which saved analysis it came from.`;
 
@@ -3311,26 +3361,83 @@ const CASE_TOOL = {
   eager_input_streaming: true,
 };
 
-function caseTool(cases) {
+const ANALYSIS_TOOL = {
+  name: 'read_saved_analysis',
+  description: 'Open one of my full saved analyses of a case: kind = breakdown, support, compare, gaps, better, chat, or highlights. For support/compare/gaps, give the point_id (or leave it empty for all points).',
+  input_schema: { type: 'object', properties: { case_id: { type: 'string' }, kind: { type: 'string', enum: ['breakdown', 'support', 'compare', 'gaps', 'better', 'chat', 'highlights'] }, point_id: { type: 'string' } }, required: ['case_id', 'kind', 'point_id'], additionalProperties: false },
+  strict: true,
+  eager_input_streaming: true,
+};
+const FILING_TOOL = {
+  name: 'read_filing',
+  description: 'Open the full text of one of the other side’s filings, by its filing id.',
+  input_schema: { type: 'object', properties: { filing_id: { type: 'string' } }, required: ['filing_id'], additionalProperties: false },
+  strict: true,
+  eager_input_streaming: true,
+};
+
+/** Tools Claude can use to open things from this phone. A reading budget keeps the request under Claude's size limit. */
+function caseTool(cases, filings = []) {
+  let budget = 1000000; // characters Claude may open in one drafting job (~310k tokens)
+  const give = (label, text) => {
+    if (budget <= 0) return `Reading budget for this request is used up — rely on the research file and what you have already opened.`;
+    let t = String(text);
+    if (t.length > Math.min(budget, 260000)) t = t.slice(0, Math.min(budget, 260000)) + '\n[…truncated to fit the request size limit]';
+    budget -= t.length;
+    return `${label}\n\n${t}`;
+  };
+  const findCase = (id) => {
+    if (typeof id !== 'string') throw new Error('case_id must be a string');
+    const c = cases.find((x) => x.id === id);
+    if (!c) throw new Error(`No case with id ${id}. Use an id from the research file.`);
+    return c;
+  };
   return {
     read_case_text: async (input) => {
-      if (!input || typeof input.case_id !== 'string') throw new Error('case_id must be a string');
-      const c = cases.find((x) => x.id === input.case_id);
-      if (!c) throw new Error(`No case with id ${input.case_id}. Use an id from the research file.`);
+      const c = findCase(input?.case_id);
       if (!c.text) return `${caseTitle(c)} has not been pulled yet — only its saved analyses are available.`;
-      return `${caseTitle(c)}${c.citation ? ', ' + c.citation : ''}\n\n${c.text}`;
+      return give(`${caseTitle(c)}${c.citation ? ', ' + c.citation : ''}`, c.text);
+    },
+    read_saved_analysis: async (input) => {
+      const c = findCase(input?.case_id);
+      const kind = input?.kind;
+      const pid = input?.point_id || '';
+      const pick = (obj) => Object.entries(obj || {}).filter(([k]) => !pid || k === pid).map(([k, v]) => `[point ${k}${v.verdict ? `, verdict: ${v.verdict}` : ''}]\n${v.text}`).join('\n\n');
+      let text = '';
+      if (kind === 'breakdown') text = c.breakdown || '';
+      else if (kind === 'support') text = pick(c.support);
+      else if (kind === 'compare') text = pick(c.compare);
+      else if (kind === 'gaps') text = pick(c.compareResearch);
+      else if (kind === 'better') text = c.better?.text || '';
+      else if (kind === 'chat') { const q = []; for (let i = 0; i + 1 < (c.chat || []).length; i += 2) q.push(`Q: ${c.chat[i].display || c.chat[i].content}\nA: ${c.chat[i + 1].content}`); text = q.join('\n\n'); }
+      else if (kind === 'highlights') text = (c.annotations || []).map((a) => `- [${HL[a.color] || a.color}] “${a.quote}”${a.note ? ` — my note: ${a.note}` : ''}`).join('\n');
+      else throw new Error('Unknown kind');
+      return text ? give(`${caseTitle(c)} — saved ${kind}`, text) : `No saved ${kind} for ${caseTitle(c)}${pid ? ` on point ${pid}` : ''}.`;
+    },
+    read_filing: async (input) => {
+      const f = filings.find((x) => x.id === input?.filing_id);
+      if (!f) throw new Error(`No filing with id ${input?.filing_id}.`);
+      return give(`${f.name} (${docLabel(f)})`, f.text || '');
     },
   };
 }
 
-async function draftSystem(p, cases) {
+/** Build the drafting system prompt, shrinking the research file / filings until the whole request fits. */
+async function draftSystem(p, cases, userText = '') {
   await loadManual();
-  const blocks = [{ type: 'text', text: DRAFT_RULES + `\n\nPROJECT: ${p.name}\nCOURT / JURISDICTION: ${p.court || 'not specified'}\nOUR SIDE: ${p.side || 'not specified'}${matterText(p) ? '\n' + matterText(p) : ''}` }];
+  const head = [{ type: 'text', text: DRAFT_RULES + `\n\nPROJECT: ${p.name}\nCOURT / JURISDICTION: ${p.court || 'not specified'}\nOUR SIDE: ${p.side || 'not specified'}${matterText(p) ? '\n' + matterText(p) : ''}` }];
   const m = manualBlock();
-  if (m) blocks.push(m);
-  blocks.push({ type: 'text', text: researchFile(p, cases), cache_control: { type: 'ephemeral' } });
-  blocks.push(...(await filingsBlock(p)));
-  return blocks;
+  if (m) head.push(m);
+  const fixed = estTokens(head.map((b) => b.text).join('') + userText) + 3000; // + tool definitions
+  for (const [level, fmode] of [[0, 'full'], [1, 'full'], [1, 'index'], [2, 'index']]) {
+    const fb = await filingsBlock(p, { mode: fmode, maxChars: Infinity });
+    const rf = researchFile(p, cases, level);
+    const total = fixed + estTokens(rf) + estTokens(fb.map((b) => b.text).join(''));
+    if (total <= DRAFT_BUDGET_TOKENS) {
+      return { blocks: [...head, { type: 'text', text: rf, cache_control: { type: 'ephemeral' } }, ...fb], level, filingsMode: fmode, tokens: total };
+    }
+  }
+  throw new Error('This brief plus your manual is too long to send to Claude in one request, even with your research summarized. Try splitting the brief, or shortening the manual.');
 }
 
 /* ============================== Versions & sources ============================== */
@@ -3415,7 +3522,6 @@ async function runDraftJob(p, kind, { version, review, instruction, outEl }) {
   const cases = await projectCases(p.id);
   draftJob = { pid: p.id, label: kind };
   try {
-    const system = await draftSystem(p, cases);
     let user;
     if (kind === 'first') {
       user = `Write a complete first draft of my brief.
@@ -3434,12 +3540,14 @@ After </brief>, write "## Notes" with what is still missing ([cite] placeholders
         user = `${header}\n\nMY REQUEST: ${instruction}\n\nMake the changes this request needs, plus anything elsewhere that's needed to keep the brief consistent (list those in the change log). Leave the rest exactly as it is. Follow my manual. Consider the whole brief.\n\n${EDIT_FORMAT}`;
       }
     }
+    const fitted = await draftSystem(p, cases, user);
     const status = outEl.closest('.card')?.querySelector('.jobstatus');
+    if (fitted.level > 0 && status) toast('Your research is large, so Claude gets a summary and opens the full analyses it needs.', 5000);
     const r = await streamInto(outEl, {
-      system,
+      system: fitted.blocks,
       messages: [{ role: 'user', content: user }],
-      tools: [CASE_TOOL],
-      clientTools: caseTool(cases),
+      tools: [CASE_TOOL, ANALYSIS_TOOL, FILING_TOOL],
+      clientTools: caseTool(cases, await projectFilings(p.id)),
       maxTokens: 64000,
       onProgress: (phase) => { if (status) status.textContent = phase === 'tool' ? 'Reading a case from your research…' : phase === 'resume' ? 'Connection dropped — picking up where it left off…' : phase === 'retry' ? 'Reconnecting…' : 'Writing…'; },
     });
