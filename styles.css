@@ -329,3 +329,4 @@ dl.matter dd { margin: 0; white-space: pre-wrap; }
 .decide .btn.on[data-d="accept"] { background: color-mix(in srgb, var(--ok) 18%, var(--card)); border-color: var(--ok); }
 .decide .btn.on[data-d="reject"] { background: color-mix(in srgb, var(--bad) 14%, var(--card)); border-color: var(--bad); }
 .sugg-diff { padding: 12px 14px; border-radius: 10px; font-size: 16px; box-shadow: none; }
+.srcchip.rec { color: var(--ok); }

@@ -278,3 +278,4 @@ sup.fnref { font-family: var(--sans); font-size: 11px; font-weight: 700; color: 
 .pill.cite-pill { background: transparent; border: 1.5px solid; }
 .pill.cite-pill.ok { border-color: var(--c-ok); color: var(--c-ok); } .pill.cite-pill.confirm { border-color: var(--c-confirm); color: var(--c-confirm); }
 .pill.cite-pill.support { border-color: var(--c-support); color: var(--c-support); } .pill.cite-pill.none { border-color: var(--c-none); color: var(--c-none); }
+.src.rec { color: var(--g-line); font-size: 12px; }

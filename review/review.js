@@ -6,6 +6,7 @@
 import { buildSections, blocksFromParagraphs, paragraphsFromText, normalize, ranges } from '../shared/brief.mjs';
 import { extractDocxBlocks } from '../shared/docx.mjs';
 import { db, uid } from '../shared/db.mjs';
+import { openDocViewer, displayText, quotesFromAnalysis } from '../shared/passages.mjs';
 
 const APP_VERSION = 'review-1';
 const PREFS_KEY = 'cr.review.prefs';
@@ -168,6 +169,7 @@ function createReview(name, blocks, extra = {}) {
     quoteChanged: {},
     prev: {},
     sources: {},
+    recordSources: {},
     ...extra,
   };
 }
@@ -222,6 +224,14 @@ function applyCarryOver(prev, next) {
 
 // Link sentences to the cases / saved analyses that support them (shown as ⚖).
 async function attachSources(rev, version) {
+  const recs = version.recordSources || [];
+  if (recs.length) {
+    rev.recordSources = {};
+    for (const x of sentences(rev)) {
+      const hit = recs.filter((r) => normalize(r.text) === normalize(x.text));
+      if (hit.length) rev.recordSources[x.key] = hit.map((r) => ({ docId: r.docId, quote: r.quote || '', pin: r.pin || '' }));
+    }
+  }
   const list = version.sources || [];
   if (!list.length) return;
   const byText = new Map();
@@ -492,7 +502,8 @@ function renderLegend() {
         h('span', { class: 'lg yellow' }, '~ Refine'),
         h('span', { class: 'lg red' }, '✗ Revise'),
         h('span', { class: 'lg' }, '✎ Comment'),
-        h('span', { class: 'lg' }, '⚖ Source')]);
+        h('span', { class: 'lg' }, '⚖ Case'),
+        h('span', { class: 'lg' }, '📄 Record')]);
 }
 
 function renderTools(spec, label) {
@@ -545,6 +556,7 @@ function renderSection(sec) {
       if (j) ptext.append(' ');
       ptext.append(h('span', { class: sentenceClass(k), 'data-k': k, role: 'button', tabindex: '0' }, ...textWithMarkers(text)));
       if (review.sources[k]?.length) ptext.append(h('button', { class: 'src', type: 'button', 'data-src': k, 'aria-label': 'Show the case and analysis behind this sentence', title: 'Source' }, '⚖'));
+      (review.recordSources?.[k] || []).forEach((rs, ri) => ptext.append(h('button', { class: 'src rec', type: 'button', 'data-rec': `${k}|${ri}`, 'aria-label': 'Open the record document at the supporting words', title: rs.pin || 'Record' }, '📄' + (rs.pin ? ' ' + rs.pin : ''))));
     });
     body.push(h('div', { class: 'para' }, renderTools(`${sec.id}|${idx}`, itemLabel(it)), ptext));
   });
@@ -707,6 +719,8 @@ main.addEventListener('click', (e) => {
   if (tool) return setTool(tool.dataset.tool);
   const all = t.closest('[data-all]');
   if (all) return onAll(all.dataset.all);
+  const rec = t.closest('[data-rec]');
+  if (rec) { const i = rec.dataset.rec.lastIndexOf('|'); return openRecord(rec.dataset.rec.slice(0, i), +rec.dataset.rec.slice(i + 1)); }
   const src = t.closest('[data-src]');
   if (src) return openSources(src.dataset.src);
   const rate = t.closest('[data-rate]');
@@ -812,9 +826,29 @@ async function openSources(k) {
       h('div', { class: 'hint' }, `From: ${ANALYSIS_LABELS[s.kind] || s.kind}${s.kind === 'support' && c?.support?.[s.propId]?.at ? `, saved ${new Date(c.support[s.propId].at).toLocaleDateString()}` : ''}`),
       h('div', { class: 'hint' }, 'Your saved research about the case (possibly from an earlier draft), not a comment on this sentence.'),
       ex ? h('p', { class: 'src-ex' }, ex) : h('p', { class: 'hint' }, c ? 'No saved analysis text for this link.' : 'This case is not saved on this device.'),
-      c ? h('a', { class: 'btn', href: `index.html#/c/${encodeURIComponent(c.id)}?tab=${tab}${s.propId ? '&prop=' + encodeURIComponent(s.propId) : ''}` }, 'Open the case ↗') : null));
+      c ? h('div', { class: 'btn-row' },
+        c.text ? h('button', { class: 'btn primary', type: 'button', onclick: () => { $('#dlg-src').close(); openCase(c, s.propId, x ? x.text : ''); } }, '📖 Read the case here') : null,
+        h('a', { class: 'btn', href: `index.html#/c/${encodeURIComponent(c.id)}?tab=${tab}${s.propId ? '&prop=' + encodeURIComponent(s.propId) : ''}` }, 'Open in Case Review ↗')) : null));
   }
   openDialog('dlg-src');
+}
+
+/** Read a case in a pop-up over the review, at the passages that support the point. */
+function openCase(c, propId, sentence) {
+  const sp = propId ? c.support?.[propId] : null;
+  const quotes = sp ? (sp.quotes?.length ? sp.quotes : quotesFromAnalysis(sp.text, 'The exact language that helps', 'Language that helps us'))
+    : Object.values(c.support || {}).flatMap((x) => x.quotes || []);
+  openDocViewer({ title: c.name || c.citation, subtitle: c.citation || '', text: displayText(c), passages: quotes, sentence });
+}
+
+/** Open the record document behind a sentence, at the quoted words. */
+async function openRecord(k, i) {
+  const rs = review.recordSources?.[k]?.[i];
+  if (!rs) return;
+  const d = await db.get('cases', rs.docId);
+  if (!d) { toast('That document isn’t on this device.'); return; }
+  const x = findSentence(k);
+  openDocViewer({ title: d.name, subtitle: rs.pin ? `Cited at ${rs.pin}` : 'Record document', text: displayText(d), passages: [{ quote: rs.quote, pin: rs.pin }], sentence: x ? x.text : '', note: rs.quote ? '' : 'No exact quote was saved for this cite.' });
 }
 
 // ---------------------------------------------------------------- paste

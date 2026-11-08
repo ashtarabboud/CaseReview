@@ -1,0 +1,35 @@
+/* Pop-up document reader (shared by the main app and the review screen) */
+.dv-bg {
+  --dv-bg: #fbf8f1; --dv-ink: #2b2722; --dv-muted: #8a8173; --dv-line: #e6dfd0; --dv-soft: #efe9dc;
+  --dv-mark: #ede4ff; --dv-mark-on: #d8c6ff; --dv-accent: #6d28d9; --dv-btn: #fffdf9;
+  position: fixed; inset: 0; z-index: 200; background: rgba(0, 0, 0, .45);
+  display: flex; align-items: flex-end; justify-content: center;
+}
+@media (prefers-color-scheme: dark) {
+  .dv-bg { --dv-bg: #17191e; --dv-ink: #dcd8cf; --dv-muted: #8d887d; --dv-line: #2c3038; --dv-soft: #262a31; --dv-mark: #3b2a63; --dv-mark-on: #5b3fa0; --dv-accent: #c4b5fd; --dv-btn: #1f232a; }
+}
+.dv-panel {
+  background: var(--dv-bg); color: var(--dv-ink); width: 100%; max-width: 760px; height: 94vh; height: 94dvh;
+  border-radius: 18px 18px 0 0; display: flex; flex-direction: column; overflow: hidden;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+@media (min-width: 760px) { .dv-bg { align-items: center; } .dv-panel { border-radius: 18px; height: 90vh; } }
+.dv-head { display: flex; align-items: flex-start; gap: 10px; padding: 14px 16px 8px; border-bottom: 1px solid var(--dv-line); font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+.dv-titles { flex: 1; min-width: 0; }
+.dv-title { font-weight: 700; font-size: 16px; }
+.dv-sub { font-size: 12.5px; color: var(--dv-muted); }
+.dv-x { border: 1px solid var(--dv-line); background: var(--dv-btn); color: var(--dv-ink); border-radius: 10px; font-size: 18px; width: 40px; height: 40px; cursor: pointer; }
+.dv-sentence, .dv-note { margin: 10px 16px 0; padding: 8px 12px; border-radius: 10px; background: var(--dv-soft); font: 14.5px/1.45 -apple-system, sans-serif; }
+.dv-label { display: block; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--dv-muted); margin-bottom: 2px; }
+.dv-note { background: transparent; color: var(--dv-muted); padding: 0 2px; font-size: 13px; }
+.dv-nav { display: flex; align-items: center; gap: 8px; padding: 8px 16px; font: 14px -apple-system, sans-serif; }
+.dv-count { flex: 1; color: var(--dv-muted); }
+.dv-btn { border: 1px solid var(--dv-line); background: var(--dv-btn); color: var(--dv-ink); border-radius: 10px; min-width: 40px; height: 38px; padding: 0 12px; font: 600 16px -apple-system, sans-serif; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
+.dv-why { padding: 0 16px; font: 13.5px/1.4 -apple-system, sans-serif; color: var(--dv-accent); }
+.dv-text { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 10px 20px 40px; font: 18px/1.7 "Iowan Old Style", Palatino, Georgia, serif; overflow-wrap: break-word; }
+.dv-text p { margin: 0 0 1em; }
+.dv-page { text-align: center; font: 700 11.5px -apple-system, sans-serif; letter-spacing: .08em; text-transform: uppercase; color: var(--dv-muted); border-top: 1px dashed var(--dv-line); padding-top: 6px; margin: 1.4em 0 1em; }
+.dv-mark { background: var(--dv-mark); color: inherit; border-bottom: 2px solid var(--dv-accent); border-radius: 3px; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+.dv-mark.on { background: var(--dv-mark-on); }
+.dv-chip { font: 700 11.5px -apple-system, sans-serif; color: var(--dv-accent); border: 1px solid var(--dv-accent); border-radius: 999px; padding: 0 6px; margin-right: 4px; vertical-align: .15em; }
+.dv-foot { padding: 8px 16px 12px; border-top: 1px solid var(--dv-line); }

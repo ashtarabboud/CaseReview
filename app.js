@@ -4,12 +4,13 @@ import { Anthropic } from './vendor/anthropic.mjs';
 import { marked } from './vendor/marked.esm.js';
 import DOMPurify from './vendor/purify.es.mjs';
 import { db, uid } from './shared/db.mjs';
-import { buildSections, blocksFromParagraphs, paragraphsFromText, blocksFromMarkup, labeledBrief, applyEdits, diffBlocks, diffWords, blocksToPlainText, normalize, units } from './shared/brief.mjs';
+import { buildSections, blocksFromParagraphs, paragraphsFromText, blocksFromMarkup, labeledBrief, applyEdits, diffBlocks, diffWords, blocksToPlainText, normalize, units, matchSentence } from './shared/brief.mjs';
 import { extractDocxBlocks, buildDocx } from './shared/docx.mjs';
+import { normMap, findQuote, quotesFromAnalysis, pinAt, mdSection, openDocViewer, displayText } from './shared/passages.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '18';
+const APP_VERSION = '19';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -50,7 +51,12 @@ navigator.storage?.persist?.().catch(() => {});
 
 const isFiling = (c) => c?.kind === 'filing';
 // Cases (opinions) only, unless { filings: true }. The other side's filings are stored alongside but listed separately.
-const projectCases = async (pid, { filings = false } = {}) => (await db.all('cases')).filter((c) => c.projectId === pid && (filings || !isFiling(c)));
+const isRecord = (c) => c?.kind === 'record';
+// Cases (opinions) only, unless { filings: true } (then everything: filings and record documents too).
+const projectCases = async (pid, { filings = false } = {}) => (await db.all('cases')).filter((c) => c.projectId === pid && (filings || !c.kind));
+const projectRecords = async (pid) => (await db.all('cases')).filter((c) => c.projectId === pid && isRecord(c));
+const RECORD_TYPES = { complaint: 'Complaint', answer: 'Answer', policy: 'Policy', declarations: 'Declarations page', contract: 'Contract', exhibit: 'Exhibit', deposition: 'Deposition / transcript', correspondence: 'Letter / email', other: 'Other document' };
+const recLabel = (c) => RECORD_TYPES[c.docType] || 'Document';
 const projectFilings = async (pid) => (await db.all('cases')).filter((c) => c.projectId === pid && isFiling(c));
 const DOC_TYPES = { complaint: 'Complaint', motion: 'Motion', brief: 'Brief / memorandum', other: 'Other filing' };
 const docLabel = (c) => DOC_TYPES[c.docType] || 'Filing';
@@ -368,7 +374,13 @@ function systemFor(p, c) {
   if (matterText(p)) ctx += '\n' + matterText(p);
   if (p.draft) ctx += `\n\nMY DRAFT BRIEF (context for everything we discuss):\n<brief>\n${p.draft}\n</brief>`;
   blocks.push({ type: 'text', text: ctx, cache_control: { type: 'ephemeral' } });
-  if (c?.text && isFiling(c)) {
+  if (c?.text && isRecord(c)) {
+    blocks.push({
+      type: 'text',
+      text: `RECORD DOCUMENT WE ARE READING (${recLabel(c)}): ${c.name}\n(A document in the record of this matter. "[Page N]" marks the start of page N.)\n<document>\n${c.text}\n</document>`,
+      cache_control: { type: 'ephemeral' },
+    });
+  } else if (c?.text && isFiling(c)) {
     blocks.push({
       type: 'text',
       text: `THE OTHER SIDE'S ${docLabel(c).toUpperCase()} WE ARE READING: ${c.name}\n(This is the opposing party's filing, not a court opinion. Paragraph numbers like "12." are the filing's own numbered paragraphs.)\n<document>\n${c.text}\n</document>`,
@@ -395,7 +407,7 @@ function loadScript(src) {
   });
 }
 
-async function pdfToText(buf) {
+async function pdfToText(buf, { pages = false } = {}) {
   await import('./vendor/rs-polyfill.mjs');
   const pdfjs = await import('./vendor/pdf.min.mjs');
   pdfjs.GlobalWorkerOptions.workerSrc = new URL('./vendor/pdf.worker.shim.mjs', import.meta.url).href;
@@ -404,6 +416,7 @@ async function pdfToText(buf) {
   for (let i = 1; i <= doc.numPages; i++) {
     const page = await doc.getPage(i);
     const tc = await page.getTextContent();
+    if (pages) out += `[Page ${i}]\n\n`;
     let line = '';
     for (const it of tc.items) {
       line += it.str;
@@ -420,10 +433,10 @@ async function pdfToText(buf) {
     .trim();
 }
 
-async function fileToText(file) {
+async function fileToText(file, { pages = false } = {}) {
   const name = file.name.toLowerCase();
   if (name.endsWith('.pdf') || file.type === 'application/pdf') {
-    const t = await pdfToText(await file.arrayBuffer());
+    const t = await pdfToText(await file.arrayBuffer(), { pages });
     if (t.replace(/\s/g, '').length < 200) throw new Error('This PDF seems to be a scanned image with no text layer. Try downloading it again as a text PDF (Westlaw’s normal PDF download works).');
     return t;
   }
@@ -923,7 +936,7 @@ async function viewProject(pid, tab, q = {}) {
   if (p.analyzing && Date.now() - (p.updatedAt || 0) > 15 * 60 * 1000) { p.analyzing = false; p.analyzeError = 'The last analysis didn’t finish (the app may have been closed). Try again.'; await save('projects', p); }
   const cases = await projectCases(pid);
   const menu = h('button', { class: 'iconbtn', 'aria-label': 'Project menu', onclick: () => projectMenu(p) }, '⋯');
-  const items = p.quick ? [['cases', 'Cases'], ['research', 'Research chat']] : [['points', 'Points'], ['filings', 'Their filings'], ['draft', 'Draft & review'], ['research', 'Research chat'], ['cases', `Cases (${cases.length})`], ['brief', 'Uploaded draft']];
+  const items = p.quick ? [['cases', 'Cases'], ['research', 'Research chat']] : [['points', 'Points'], ['filings', 'Their filings'], ['record', 'Record docs'], ['draft', 'Draft & review'], ['research', 'Research chat'], ['cases', `Cases (${cases.length})`], ['brief', 'Uploaded draft']];
   if (p.quick && tab !== 'research') tab = 'cases';
   const main = h('main', {});
   app.replaceChildren(header(p.name, '#/', p.court || null, menu), tabs(items, tab, (k) => `#/p/${pid}?tab=${k}`), main);
@@ -992,6 +1005,7 @@ async function viewProject(pid, tab, q = {}) {
 
   if (tab === 'draft') return draftTab(main, p, q);
   if (tab === 'filings') return filingsTab(main, p);
+  if (tab === 'record') return recordTab(main, p);
 
   if (tab === 'research') return researchTab(main, p, cases);
 
@@ -1852,17 +1866,18 @@ async function viewCase(cid, tab, propId) {
   if (!c) return go('#/');
   const p = await db.get('projects', c.projectId);
   const prop = p.props?.find((x) => x.id === propId);
-  const back = prop ? `#/p/${p.id}/prop/${prop.id}` : `#/p/${p.id}?tab=${isFiling(c) ? 'filings' : 'cases'}`;
+  const back = prop ? `#/p/${p.id}/prop/${prop.id}` : `#/p/${p.id}?tab=${isFiling(c) ? 'filings' : isRecord(c) ? 'record' : 'cases'}`;
   const qs = (t) => `#/c/${cid}?tab=${t}${propId ? '&prop=' + propId : ''}`;
   const menu = h('button', { class: 'iconbtn', 'aria-label': 'Case menu', onclick: () => caseMenu(c) }, '⋯');
   const main = h('main', {});
   const filing = isFiling(c);
-  const items = filing
+  const record = isRecord(c);
+  const items = record ? [['read', 'Read'], ['chat', 'Ask'], ['notes', 'Saved']] : filing
     ? [['read', 'Read'], ['breakdown', 'Review it'], ['chat', 'Ask'], ['notes', 'Saved']]
     : [['read', 'Read'], ['breakdown', 'Break it down'], ...(p.quick ? [] : [['compare', 'Compare'], ['support', 'Support?']]), ['chat', 'Ask'], ['notes', 'Saved']];
-  const hdr = header(caseTitle(c), back, filing ? `Their ${docLabel(c).toLowerCase()} · ${p.name}` : ([c.citation, c.court, c.year].filter(Boolean).join(' · ') || null), menu);
+  const hdr = header(caseTitle(c), back, record ? `${recLabel(c)} · record · ${p.name}` : filing ? `Their ${docLabel(c).toLowerCase()} · ${p.name}` : ([c.citation, c.court, c.year].filter(Boolean).join(' · ') || null), menu);
   hdr.classList.add('compact');
-  if (!filing && !p.quick && p.props?.length) hdr.append(propBar(p, c, prop, tab));
+  if (!filing && !record && !p.quick && p.props?.length) hdr.append(propBar(p, c, prop, tab));
   app.replaceChildren(hdr, tabs(items, tab, qs), main);
 
   if (!c.text) return getCasePanel(main, c, p);
@@ -2081,6 +2096,7 @@ function segmentSentences(p, from = 0) {
 /** Make sure a case's text is in the clean format; remap old highlights onto it. */
 async function ensureCleanText(c) {
   if (!c.text || c.fmt === TEXT_FORMAT) return;
+  if (isRecord(c)) { c.fmt = TEXT_FORMAT; await save('cases', c); return; }
   const clean = normalizeOpinion(c.text, { numbered: isFiling(c) });
   const squash = (s) => s.replace(/\s+/g, ' ').trim();
   c.annotations = (c.annotations || []).map((a) => {
@@ -2119,50 +2135,8 @@ function fillSentence(span, c) {
 
 /* ---- Support passages (pin cites) ---- */
 
-/** Normalised copy of the text (lowercase, plain quotes/dashes, single spaces) with a map back to original offsets. */
-function normMap(text) {
-  let out = '';
-  const map = [];
-  let space = true;
-  for (let i = 0; i < text.length; i++) {
-    let ch = text[i];
-    if (ch === '‘' || ch === '’') ch = "'"; else if (ch === '“' || ch === '”') ch = '"'; else if (ch === '–' || ch === '—') ch = '-';
-    if (/\s/.test(ch)) { if (space) continue; ch = ' '; space = true; } else space = false;
-    out += ch.toLowerCase();
-    map.push(i);
-  }
-  return { out, map };
-}
 
-/** Find a quoted passage in the opinion, tolerating curly quotes, spacing, [a]lterations and ellipses. Returns [start, end] or null. */
-function findQuote(text, quote, nm) {
-  const { out, map } = nm || normMap(text);
-  let q = normMap(String(quote).replace(/\[\^\d+\]/g, '').replace(/\[([a-zA-Z])\]/g, '$1')).out.trim().replace(/^["'“]+|["'”]+$/g, '').trim();
-  if (q.length < 12) return null;
-  const at = (needle, from = 0) => { const i = out.indexOf(needle, from); return i < 0 ? null : [i, i + needle.length]; };
-  const toOrig = ([a, b]) => [map[a], map[b - 1] + 1];
-  let hit = at(q);
-  if (hit) return toOrig(hit);
-  const parts = q.split(/\s*(?:\.\s?\.\s?\.|…)\s*/).map((x) => x.trim()).filter((x) => x.length >= 12);
-  if (parts.length > 1) {
-    const a = at(parts[0]);
-    const b = a && at(parts[parts.length - 1], a[1]);
-    if (a && b) return toOrig([a[0], b[1]]);
-    if (a) return toOrig(a);
-  }
-  const head = at(q.slice(0, 70));
-  if (head) { const tail = at(q.slice(-50), head[1]); return toOrig([head[0], tail && tail[1] - head[0] < q.length * 2 ? tail[1] : head[1]]); }
-  return null;
-}
 
-/** Quotes from an older analysis that didn't save them separately. */
-function quotesFromAnalysis(text, ...sections) {
-  const sec = sections.map((n) => mdSection(text, n)).find(Boolean) || '';
-  const out = [];
-  for (const m of sec.matchAll(/[“"]([^”"]{25,600})[”"]/g)) out.push({ quote: m[1] });
-  for (const line of sec.split('\n')) { const m = /^>\s*(.{25,})$/.exec(line.trim()); if (m && !out.some((o) => m[1].includes(o.quote))) out.push({ quote: m[1].replace(/^["“]|["”]$/g, '') }); }
-  return out;
-}
 
 /** The passages to mark for this case: support for the pinned point, or (no point) every point's support + best quotes. */
 function supportPassages(c, p, prop) {
@@ -2181,14 +2155,6 @@ function supportPassages(c, p, prop) {
   return out;
 }
 
-/** Page (*512) and ¶ for a position in the opinion. */
-function pinAt(text, pos) {
-  const star = [...text.slice(Math.max(0, pos - 30000), pos).matchAll(/\*{1,2}(\d{1,4})\b/g)].pop();
-  const ps = text.lastIndexOf('\n\n', pos);
-  const head = text.slice(ps < 0 ? 0 : ps + 2, (ps < 0 ? 0 : ps + 2) + 24);
-  const pm = head.match(PARA_MARK) || head.match(NUMBERED_PARA);
-  return [star ? '*' + star[1] : null, pm ? '¶ ' + pm[1].replace(/[{}¶\s.]/g, '') : null].filter(Boolean).join(', ');
-}
 
 /** Mark the sentences holding each passage, add a 📍 tag with its pin cite, and return the located passages. */
 function markSupport(el, c, passages) {
@@ -2278,7 +2244,7 @@ async function readTab(main, c, p, prop) {
   const op = h('article', { class: 'reader', id: 'opinion' });
   applyReader(op);
   renderOpinion(op, c);
-  const found = isFiling(c) ? [] : markSupport(op, c, supportPassages(c, p, prop));
+  const found = isFiling(c) ? [] : markSupport(op, c, isRecord(c) ? await recordPassages(c, p) : supportPassages(c, p, prop));
   let cur = -1;
   const counter = h('span', { class: 'grow small' });
   const jump = (i) => {
@@ -2901,7 +2867,12 @@ function chatTab(main, c, p, prop) {
   const input = h('textarea', { placeholder: isFiling(c) ? 'Ask about their filing…' : 'Ask about this case…', rows: 1 });
   input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; });
   const send = h('button', { class: 'btn primary', 'aria-label': 'Send' }, '↑');
-  const quick = isFiling(c) && c.docType === 'complaint' ? [
+  const quick = isRecord(c) ? [
+    'Summarize this document.',
+    'What are the key terms, dates, and amounts?',
+    'What does it say that matters for our case?',
+    'Is there anything here that hurts us?',
+  ] : isFiling(c) && c.docType === 'complaint' ? [
     'Who are the parties, and who is suing whom?',
     'What exactly do they say we did?',
     'Which allegations are weakest or most conclusory?',
@@ -3317,6 +3288,99 @@ async function defensesToPoints(p, c, btn) {
   }
 }
 
+/* ============================== Record documents (complaint, policy, dec page, exhibits…) ============================== */
+
+/** Passages of a record document that the latest draft cites, for the reader. */
+async function recordPassages(c, p) {
+  const vs = (await db.byIndex('versions', 'projectId', p.id)).sort((a, b) => a.n - b.n);
+  const latest = vs[vs.length - 1];
+  return (latest?.recordSources || []).filter((r) => r.docId === c.id && r.quote).map((r) => ({ quote: r.quote, pin: r.pin, why: `Cited in draft v${latest.n}: “${cap(r.text, 160)}”`, kind: 'support' }));
+}
+
+async function addRecordSheet(p) {
+  const type = h('select', {}, Object.entries(RECORD_TYPES).map(([k, v]) => h('option', { value: k }, v)));
+  const name = h('input', { type: 'text', placeholder: 'e.g., Acme Policy No. 123 (2025–26)' });
+  const status = h('div', { class: 'small muted' });
+  const state = { files: [] };
+  const input = h('input', { type: 'file', accept: '.pdf,.docx,.txt,.md', multiple: true });
+  input.addEventListener('change', async () => {
+    state.files = [];
+    for (const f of input.files) {
+      status.textContent = `Reading ${f.name}…`;
+      try { state.files.push({ name: f.name.replace(/\.\w+$/, ''), text: await fileToText(f, { pages: true }) }); }
+      catch (e) { status.textContent = `⚠️ ${f.name}: ${e.message}`; return; }
+    }
+    status.textContent = `✓ ${state.files.map((x) => `${x.name} (${(x.text.match(/\[Page \d+\]/g) || []).length || '?'} pages)`).join(', ')}`;
+  });
+  const paste = h('textarea', { placeholder: 'Or paste the text…' });
+  const ok = await sheet('Add record documents', h('div', {},
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'The complaint, the policy, the declarations page, contracts, exhibits, letters. Claude checks the facts in your draft against these and adds record pin cites. PDFs keep their page numbers.'),
+    h('label', { class: 'f' }, 'What is it?'), type,
+    h('label', { class: 'f' }, 'Name (optional — used when you add one file)'), name,
+    h('label', { class: 'file', style: 'margin-top:12px' }, input, '📎 Upload (PDF, Word, or text — you can pick several)'), status,
+    h('label', { class: 'f' }, 'Paste instead'), paste),
+  [{ label: 'Add', run: () => !!(state.files.length || paste.value.trim()) || (toast('Upload a file or paste the text'), false) }]);
+  if (!ok) return;
+  const docs = state.files.length ? state.files : [{ name: '', text: paste.value.trim() }];
+  for (const d of docs) {
+    const c = newCase(p.id, { name: (docs.length === 1 && name.value.trim()) || d.name || RECORD_TYPES[type.value] });
+    Object.assign(c, { kind: 'record', docType: type.value, text: d.text, source: 'Uploaded', fmt: TEXT_FORMAT });
+    await save('cases', c);
+  }
+  toast(`Added ${docs.length} document${docs.length === 1 ? '' : 's'}`);
+  route();
+}
+
+async function recordTab(main, p) {
+  const docs = (await projectRecords(p.id)).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  const filings = await projectFilings(p.id);
+  const vs = (await db.byIndex('versions', 'projectId', p.id)).sort((a, b) => a.n - b.n);
+  const latest = vs[vs.length - 1];
+  main.append(h('div', { class: 'card' },
+    h('h3', {}, '📄 Record documents'),
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'Upload the source documents once. When the drafting assistant runs with “Check facts against the record” on, it checks every factual statement in your draft against them, adds pin cites (Compl. ¶ 12, Policy at 4), and brackets anything it can’t find. In your draft and review, 📄 next to a sentence opens the document with the supporting words underlined.'),
+    h('button', { class: 'btn primary big', onclick: () => addRecordSheet(p) }, '＋ Add documents')));
+  if (filings.length) main.append(h('p', { class: 'small muted' }, `Also used as record: ${filings.map((f) => f.name).join(', ')} (from Their filings).`));
+  if (!docs.length) { main.append(h('p', { class: 'muted' }, 'No record documents yet.')); return; }
+  for (const d of docs) {
+    const pages = (d.text.match(/\[Page \d+\]/g) || []).length;
+    const cited = (latest?.recordSources || []).filter((r) => r.docId === d.id).length;
+    main.append(h('div', { class: 'card tap', onclick: () => go(`#/c/${d.id}?tab=read`) },
+      h('div', { class: 'row', style: 'flex-wrap:nowrap; align-items:flex-start' },
+        h('h3', { class: 'grow' }, d.name),
+        h('button', { class: 'iconbtn', 'aria-label': 'Delete document', style: 'font-size:17px; margin:-6px -8px 0 0', onclick: (e) => { e.stopPropagation(); deleteCase(d); } }, '🗑')),
+      h('div', { class: 'row small' },
+        h('span', { class: 'badge' }, recLabel(d)),
+        h('span', { class: 'muted' }, pages ? `${pages} pages` : `${Math.round(d.text.length / 1000)}k characters`),
+        cited ? h('span', { class: 'badge ok' }, `📄 cited ${cited}× in draft v${latest.n}`) : null)));
+  }
+}
+
+/** Open a record document (or filing) in the pop-up reader at the quoted words. */
+async function openRecordViewer(src, sentence) {
+  const d = await db.get('cases', src.docId);
+  if (!d) return toast('That document isn’t on this device anymore');
+  openDocViewer({
+    title: d.name, subtitle: isRecord(d) ? recLabel(d) : docLabel(d), text: displayText(d),
+    passages: [{ quote: src.quote, pin: src.pin }], sentence,
+    note: src.quote ? '' : 'No exact quote was saved for this cite.',
+  });
+}
+
+/** Open a case in the pop-up reader at the passages supporting a point. */
+async function openCaseViewer(caseId, propId, sentence) {
+  const c = await db.get('cases', caseId);
+  if (!c?.text) return toast('That case hasn’t been pulled yet');
+  const p = await db.get('projects', c.projectId);
+  const prop = (p?.props || []).find((x) => x.id === propId);
+  const passages = prop ? supportPassages(c, p, prop) : supportPassages(c, p, null);
+  openDocViewer({
+    title: caseTitle(c), subtitle: [c.citation, prop ? `Support for: ${cap(prop.text, 80)}` : ''].filter(Boolean).join(' · '),
+    text: displayText(c), passages: passages.map((x) => ({ quote: x.quote, pin: x.pin, why: x.why })), sentence,
+    fullLink: { label: 'Open the full case page', href: `#/c/${c.id}?tab=read${propId ? '&prop=' + propId : ''}` },
+  });
+}
+
 /* ============================== Brief-writing manual ============================== */
 
 let MANUAL = null; // { key:'manual', name, text, at }
@@ -3377,16 +3441,6 @@ function manualCard() {
 
 const cap = (t, n) => (t && t.length > n ? t.slice(0, n) + '…' : t || '');
 
-/** A "## Heading" section of a Markdown analysis (up to the next heading of the same or higher level). */
-function mdSection(text, name) {
-  const lines = String(text || '').split('\n');
-  const i = lines.findIndex((l) => /^#{2,3}\s/.test(l) && l.replace(/^#+\s*/, '').toLowerCase().startsWith(name.toLowerCase()));
-  if (i < 0) return '';
-  const level = lines[i].match(/^#+/)[0].length;
-  let j = i + 1;
-  while (j < lines.length && !(new RegExp(`^#{1,${level}}\\s`).test(lines[j]))) j++;
-  return lines.slice(i + 1, j).join('\n').trim();
-}
 
 const CHARS_PER_TOKEN = 3.2; // conservative for legal text
 const estTokens = (t) => Math.ceil(String(t || '').length / CHARS_PER_TOKEN);
@@ -3462,7 +3516,8 @@ const DRAFT_RULES = `You are drafting and revising a legal brief with me, inside
 4. Never invent cases, quotations, holdings, pin cites, record cites, or facts. If something is missing, write a bracketed placeholder such as [cite], [pin], or [confirm holding].
 5. Track sources: every sentence you write or change that relies on a case must be listed in "sources" with the case id and which saved analysis it came from.
 6. Nothing is confirmed until I confirm it. Put anything you could not confirm in brackets right in the text: [confirm: …], [pin], [cite], [record cite], [confirm fact: …]. Sentences I marked CITE CHECKED in a review are confirmed by me: keep their citations exactly and don't bracket them.
-7. Never write notes or commentary to me inside the brief text (for example "this case does not fully support…"). Remarks go in the change log, in a bracket, or in a suggestion.`;
+7. Never write notes or commentary to me inside the brief text (for example "this case does not fully support…"). Remarks go in the change log, in a bracket, or in a suggestion.
+8. The record: facts come from my record documents (the complaint, the policy, the declarations page, exhibits, and the other side's filings), listed below. Cite them with pin cites in the form my manual uses (for example "Compl. ¶ 12", "Policy at 4", "Ex. A at 3"). Never state a fact the record doesn't support; bracket it instead. For every sentence you write or change that rests on a record document, list it in "record_sources" with the document id, the EXACT words from the document that support it, and the pin.`;
 
 const DRAFT_MODES = {
   targeted: { label: 'Targeted', desc: { revise: 'Change only what I flagged in my review (and whatever else that requires for consistency).', change: 'Change only what my request asks for (and whatever else that requires for consistency).' } },
@@ -3501,17 +3556,20 @@ async function draftOptionsSheet(p, kind, { instruction = '' } = {}) {
       h('button', { class: base.deliver === 'suggest' ? 'on' : '', onclick: () => { base.deliver = 'suggest'; deliverTouched = true; draw(); } }, 'Suggest — I approve each'));
   };
   draw();
+  const hasRecord = (await projectRecords(p.id)).length + (await projectFilings(p.id)).length > 0;
+  const recordBox = h('input', { type: 'checkbox', checked: base.record !== false });
   const remember = h('input', { type: 'checkbox', checked: true });
   const ok = await sheet(kind === 'first' ? 'First-draft options' : kind === 'revise' ? 'Revision options' : 'What kind of pass?', h('div', {},
     modes.length ? [h('label', { class: 'f', style: 'margin-top:0' }, 'What kind of pass'), radios] : null,
     h('label', { class: 'f' }, 'Cite check'), cite,
+    hasRecord ? h('label', { class: 'small row', style: 'gap:6px; margin-top:10px' }, recordBox, '📄 Check facts against the record documents and add record pin cites') : h('p', { class: 'small muted' }, 'Tip: add the complaint, policy, and other source documents under “Record docs” and Claude will check your facts against them.'),
     kind === 'first' ? null : [h('label', { class: 'f' }, 'How to deliver it'), deliver,
       h('p', { class: 'small muted' }, '“Suggest” gives you a list of proposed changes, each with the reason. You accept or reject each one, and the accepted ones become the next version.')],
     h('p', { class: 'small', style: 'margin:12px 0 0' }, '🔒 Always on: anything not confirmed is [bracketed] in the text, and sentences you marked “Cite checked” are treated as confirmed.'),
     h('label', { class: 'small row', style: 'gap:6px; margin-top:10px' }, remember, 'Remember these as my baseline for this project')),
   [{ label: 'Start', run: () => true }]);
   if (!ok) return null;
-  const opts = { mode: base.mode, cite: base.cite, deliver: kind === 'first' ? 'edits' : base.deliver };
+  const opts = { mode: base.mode, cite: base.cite, deliver: kind === 'first' ? 'edits' : base.deliver, record: hasRecord && recordBox.checked };
   if (remember.checked) {
     const fresh = await db.get('projects', p.id);
     fresh.draftPrefs = { ...(fresh.draftPrefs || {}), [kind]: opts };
@@ -3532,6 +3590,7 @@ function passInstructions(opts, kind) {
     light: 'CITE CHECK LEVEL: light — make sure every case you cite is in my research file and that my saved analysis supports the sentence it’s cited for; fix or flag mismatches.',
     thorough: 'CITE CHECK LEVEL: thorough — for EVERY citation: (1) it’s in my research file; (2) my saved support check or breakdown supports that specific proposition (open the full analysis with read_saved_analysis if you only have a summary); (3) quotations and pin cites match the opinion (open it with read_case_text); (4) the signal fits. Fix or flag every problem.',
   }[opts.cite]);
+  if (opts.record) L.push('RECORD CHECK: check every factual statement against my record documents (open them with read_record when they aren’t included in full). Add or correct record pin cites. Anything you can’t find in the record gets a bracket such as [confirm fact: …]. List every record-supported sentence in record_sources with the exact supporting words.');
   L.push('BRACKETS (always): anything not confirmed gets a bracket in the text — [confirm: …], [pin], [cite], [record cite], [confirm fact: …]. Sentences I marked CITE CHECKED are confirmed.');
   return L.join('\n\n');
 }
@@ -3539,7 +3598,7 @@ function passInstructions(opts, kind) {
 const SUGGEST_FORMAT = `HOW TO RETURN YOUR WORK
 Do not change the brief. Return suggestions I can accept or reject one at a time. The brief has an id in [brackets] before every sentence and heading.
 First write a short summary in Markdown: what you checked and the main problems you found. Then end with ONE \`\`\`json block:
-{"suggestions":[{"id":"Argument I.A ¶2 S1","type":"cite|support|accuracy|fact|style","comment":"what is wrong or could be better, and why (1–3 sentences)","replacement":"the full corrected sentence(s) as they should read — or empty if it is only a flag"}],"sources":[...same format as before...]}
+{"suggestions":[{"id":"Argument I.A ¶2 S1","type":"cite|support|accuracy|fact|record|style","comment":"what is wrong or could be better, and why (1–3 sentences)","replacement":"the full corrected sentence(s) as they should read — or empty if it is only a flag"}],"sources":[{"text":"exact sentence as it will read","case_id":"...","analysis":"...","point_id":"..."}],"record_sources":[{"text":"exact sentence as it will read (after the replacement, if any)","doc_id":"...","quote":"exact words from the document","pin":"¶ 12 or p. 4"}]}
 Rules: copy ids exactly (for a heading use "<section label> Heading"); one suggestion per sentence; most important first; a replacement must be the complete sentence ready to drop in, with [brackets] for anything unconfirmed. Don't suggest changes to sentences I marked CITE CHECKED unless the citation is plainly wrong.`;
 
 const EDIT_FORMAT = `HOW TO RETURN YOUR WORK
@@ -3559,6 +3618,7 @@ Edit types (copy ids exactly):
 - {"op":"insert_section_after","id":"Argument I.A","heading":"B. ...","paragraphs":["...","..."]}
 - {"op":"add_footnote","id":"Argument I.A ¶2 S1","text":"the footnote text"}
 Sources: {"text":"the exact final wording of the sentence","case_id":"<id from my research file>","analysis":"support|breakdown|compare|gaps|better|paragraph|chat|text","point_id":"<point id or empty>"}
+Record sources (add "record_sources": [...] next to "sources"): {"text":"the exact final wording of the sentence","doc_id":"<record document or filing id>","quote":"the exact words from the document that support it","pin":"e.g. ¶ 12 or p. 4"}
 
 Approved (GREEN) sentences are locked: the app rejects edits to them unless a comment on that sentence or a note on its section asks for a change. Prefer sentence-level edits over paragraph rewrites, so my approvals survive.`;
 
@@ -3577,6 +3637,13 @@ const ANALYSIS_TOOL = {
   strict: true,
   eager_input_streaming: true,
 };
+const RECORD_TOOL = {
+  name: 'read_record',
+  description: 'Open the full text of a record document (complaint, policy, declarations page, exhibit…) or one of the other side’s filings, by its id. "[Page N]" marks the start of each page.',
+  input_schema: { type: 'object', properties: { doc_id: { type: 'string' } }, required: ['doc_id'], additionalProperties: false },
+  strict: true,
+  eager_input_streaming: true,
+};
 const FILING_TOOL = {
   name: 'read_filing',
   description: 'Open the full text of one of the other side’s filings, by its filing id.',
@@ -3586,7 +3653,7 @@ const FILING_TOOL = {
 };
 
 /** Tools Claude can use to open things from this phone. A reading budget keeps the request under Claude's size limit. */
-function caseTool(cases, filings = []) {
+function caseTool(cases, filings = [], records = []) {
   let budget = 1000000; // characters Claude may open in one drafting job (~310k tokens)
   const give = (label, text) => {
     if (budget <= 0) return `Reading budget for this request is used up — rely on the research file and what you have already opened.`;
@@ -3623,6 +3690,11 @@ function caseTool(cases, filings = []) {
       else throw new Error('Unknown kind');
       return text ? give(`${caseTitle(c)} — saved ${kind}`, text) : `No saved ${kind} for ${caseTitle(c)}${pid ? ` on point ${pid}` : ''}.`;
     },
+    read_record: async (input) => {
+      const d = [...records, ...filings].find((x) => x.id === input?.doc_id);
+      if (!d) throw new Error(`No record document with id ${input?.doc_id}. Use an id from the record list.`);
+      return give(`${d.name} (${isRecord(d) ? recLabel(d) : docLabel(d)})`, d.text || '');
+    },
     read_filing: async (input) => {
       const f = filings.find((x) => x.id === input?.filing_id);
       if (!f) throw new Error(`No filing with id ${input?.filing_id}.`);
@@ -3638,12 +3710,21 @@ async function draftSystem(p, cases, userText = '') {
   const m = manualBlock();
   if (m) head.push(m);
   const fixed = estTokens(head.map((b) => b.text).join('') + userText) + 3000; // + tool definitions
-  for (const [level, fmode] of [[0, 'full'], [1, 'full'], [1, 'index'], [2, 'index']]) {
+  const records = await projectRecords(p.id);
+  const recordBlock = (full) => {
+    if (!records.length) return [];
+    const text = full
+      ? 'MY RECORD DOCUMENTS (full text; "[Page N]" marks each page):\n\n' + records.map((d) => `<record id="${d.id}" type="${recLabel(d)}" name="${d.name}">\n${d.text}\n</record>`).join('\n\n')
+      : 'MY RECORD DOCUMENTS (open one with read_record):\n' + records.map((d) => `<record id="${d.id}" type="${recLabel(d)}" name="${d.name}" pages="${(d.text.match(/\[Page \d+\]/g) || []).length || '?'}" length="${Math.round(d.text.length / 1000)}k characters"/>`).join('\n');
+    return [{ type: 'text', text, cache_control: { type: 'ephemeral' } }];
+  };
+  for (const [level, fmode, rfull] of [[0, 'full', true], [0, 'full', false], [1, 'full', true], [1, 'full', false], [1, 'index', false], [2, 'index', false]]) {
     const fb = await filingsBlock(p, { mode: fmode, maxChars: Infinity });
+    const rb = recordBlock(rfull);
     const rf = researchFile(p, cases, level);
-    const total = fixed + estTokens(rf) + estTokens(fb.map((b) => b.text).join(''));
+    const total = fixed + estTokens(rf) + estTokens(fb.map((b) => b.text).join('')) + estTokens(rb.map((b) => b.text).join(''));
     if (total <= DRAFT_BUDGET_TOKENS) {
-      return { blocks: [...head, { type: 'text', text: rf, cache_control: { type: 'ephemeral' } }, ...fb], level, filingsMode: fmode, tokens: total };
+      return { blocks: [...head, { type: 'text', text: rf, cache_control: { type: 'ephemeral' } }, ...fb, ...rb], level, filingsMode: fmode, tokens: total };
     }
   }
   throw new Error('This brief plus your manual is too long to send to Claude in one request, even with your research summarized. Try splitting the brief, or shortening the manual.');
@@ -3680,12 +3761,15 @@ function citationSources(blocks, cases, props) {
 
 /** Sources for a new version: unchanged sentences keep theirs; Claude's new ones are added; citations are linked. */
 function mergeSources(blocks, prevSources, claudeSources, cases, props) {
-  const present = new Set([...units(buildSections(blocks))].map((u) => normalize(u.text)));
+  const texts = [...units(buildSections(blocks))].map((u) => u.text);
   const out = [];
   const seen = new Set();
-  const add = (s) => {
+  const add = (s0) => {
+    const i = matchSentence(texts, s0.text);
+    if (i < 0) return;
+    const s = { ...s0, text: texts[i] };
     const key = normalize(s.text) + '|' + s.caseId + '|' + s.kind;
-    if (!present.has(normalize(s.text)) || seen.has(key) || !cases.some((c) => c.id === s.caseId)) return;
+    if (seen.has(key) || !cases.some((c) => c.id === s.caseId)) return;
     seen.add(key);
     out.push(s);
   };
@@ -3706,9 +3790,30 @@ async function saveVersion(p, cases, fields) {
     ...fields,
   };
   v.sources = mergeSources(v.blocks, fields.carrySources === false ? [] : prev?.sources, fields.claudeSources, cases, p.props || []);
-  delete v.claudeSources; delete v.carrySources;
+  v.recordSources = await mergeRecordSources(p, v.blocks, fields.carrySources === false ? [] : prev?.recordSources, fields.claudeRecordSources);
+  delete v.claudeSources; delete v.carrySources; delete v.claudeRecordSources;
   await db.put('versions', v);
   return v;
+}
+
+/** Record cites for a version: unchanged sentences keep theirs; Claude's new ones are added (only for real documents). */
+async function mergeRecordSources(p, blocks, prev, fromClaude) {
+  const docs = [...await projectRecords(p.id), ...await projectFilings(p.id)];
+  const texts = [...units(buildSections(blocks))].map((u) => u.text);
+  const out = [];
+  const seen = new Set();
+  const add = (x0) => {
+    const i = matchSentence(texts, x0.text);
+    if (i < 0) return;
+    const x = { ...x0, text: texts[i] };
+    const key = normalize(x.text) + '|' + x.docId + '|' + normalize(x.quote || '');
+    if (seen.has(key) || !docs.some((d) => d.id === x.docId)) return;
+    seen.add(key);
+    out.push(x);
+  };
+  for (const x of prev || []) add(x);
+  for (const x of fromClaude || []) if (x && x.doc_id) add({ text: x.text || '', docId: x.doc_id, quote: x.quote || '', pin: x.pin || '' });
+  return out;
 }
 
 /** Sentences locked by a review: green, with no comment of their own and no note on their section. */
@@ -3742,7 +3847,7 @@ ${p.draft ? `\nMy earlier draft, for reference (keep what works):\n<earlier_draf
 FORMAT: write the whole brief between <brief> and </brief>. Put "# " before every heading line, a blank line between paragraphs, "> " before each block quote, footnote markers like [^1] in the text, and the footnote bodies as "[^1]: text" lines at the end. Start with the first heading (no caption) unless I asked for one.
 ${passInstructions(opts, 'first')}
 
-After </brief>, write "## Notes" with what is still missing ([cite] placeholders), assumptions you made, and suggestions. Then end with ONE \`\`\`json block: {"sources":[{"text":"exact sentence","case_id":"...","analysis":"support|breakdown|compare|gaps|better|paragraph|chat|text","point_id":"..."}]}`;
+After </brief>, write "## Notes" with what is still missing ([cite] placeholders), assumptions you made, and suggestions. Then end with ONE \`\`\`json block: {"sources":[{"text":"exact sentence","case_id":"...","analysis":"support|breakdown|compare|gaps|better|paragraph|chat|text","point_id":"..."}],"record_sources":[{"text":"exact sentence","doc_id":"...","quote":"exact words from the document","pin":"¶ 12 or p. 4"}]}`;
     } else {
       const header = `THE CURRENT BRIEF (version ${version.n}), with ids:\n<brief>\n${labeledBrief(version.blocks)}\n</brief>`;
       const fmt = opts.deliver === 'suggest' ? SUGGEST_FORMAT : EDIT_FORMAT;
@@ -3765,8 +3870,8 @@ After </brief>, write "## Notes" with what is still missing ([cite] placeholders
     const r = await streamInto(outEl, {
       system: fitted.blocks,
       messages: [{ role: 'user', content: user }],
-      tools: [CASE_TOOL, ANALYSIS_TOOL, FILING_TOOL],
-      clientTools: caseTool(cases, await projectFilings(p.id)),
+      tools: [CASE_TOOL, ANALYSIS_TOOL, FILING_TOOL, RECORD_TOOL],
+      clientTools: caseTool(cases, await projectFilings(p.id), await projectRecords(p.id)),
       maxTokens: 64000,
       onProgress: (phase) => { if (status) status.textContent = phase === 'tool' ? 'Reading a case from your research…' : phase === 'resume' ? 'Connection dropped — picking up where it left off…' : phase === 'retry' ? 'Reconnecting…' : 'Writing…'; },
     });
@@ -3777,7 +3882,7 @@ After </brief>, write "## Notes" with what is still missing ([cite] placeholders
       if (!m) throw new Error('Claude’s reply didn’t include the brief. Try again.');
       const blocks = blocksFromMarkup(m[1]);
       const notes = stripJSONBlocks(r.text.slice(r.text.indexOf('</brief>') + 8)).trim();
-      v = await saveVersion(p, cases, { source: 'claude-first', instruction, blocks, changeLog: notes, claudeSources: json.sources || [], carrySources: false });
+      v = await saveVersion(p, cases, { source: 'claude-first', instruction, blocks, changeLog: notes, claudeSources: json.sources || [], claudeRecordSources: json.record_sources || [], carrySources: false });
     } else if (opts.deliver === 'suggest') {
       if (!Array.isArray(json.suggestions)) throw new Error('Claude’s reply didn’t include a list of suggestions. Try again.');
       const fresh = await db.get('versions', version.id);
@@ -3786,6 +3891,7 @@ After </brief>, write "## Notes" with what is still missing ([cite] placeholders
         summary: stripJSONBlocks(r.text),
         items: json.suggestions.filter((x) => x && x.id).map((x) => ({ key: uid(), id: String(x.id).replace(/^\[|\]$/g, ''), type: x.type || 'accuracy', comment: x.comment || '', replacement: x.replacement || '', decision: null })),
         sources: json.sources || [],
+        recordSources: json.record_sources || [],
       };
       await db.put('versions', fresh);
       if (review) { review.suggestedOn = version.id; await db.put('reviews', review); }
@@ -3798,7 +3904,7 @@ After </brief>, write "## Notes" with what is still missing ([cite] placeholders
         source: kind === 'revise' ? 'claude-revision' : 'claude-change',
         parentId: version.id, fromReviewId: review?.id || null, instruction: instruction || '', passOpts: opts,
         blocks: res.blocks, changeLog: stripJSONBlocks(r.text), applied: res.applied, skipped: res.skipped,
-        claudeSources: json.sources || [],
+        claudeSources: json.sources || [], claudeRecordSources: json.record_sources || [],
       });
       if (review) { review.revisedVersionId = v.id; await db.put('reviews', review); }
     }
@@ -4016,12 +4122,20 @@ async function sourceSheet(text, list) {
       h('div', { class: 'small muted' }, 'From: ' + (ANALYSIS_LABELS[s.kind] || s.kind) + (savedAt ? `, saved ${new Date(savedAt).toLocaleDateString()}` : '')),
       h('div', { class: 'small note' }, 'This is your saved research about the case (it may have been written for an earlier draft). It is not a comment on this sentence. For a check of the current draft, run a Cite check pass.'),
       ex ? h('details', { style: 'margin-top:6px' }, h('summary', {}, 'Show the saved analysis'), mdEl(ex)) : null,
-      c ? h('button', { class: 'btn slim', style: 'margin-top:8px', onclick: () => { $('#sheet-root').innerHTML = ''; go(`#/c/${c.id}?tab=${tab}${s.propId ? '&prop=' + s.propId : ''}`); } }, 'Open the case') : null));
+      c ? h('div', { class: 'row', style: 'margin-top:8px' },
+        c.text ? h('button', { class: 'btn slim primary', onclick: () => { $('#sheet-root').innerHTML = ''; openCaseViewer(c.id, s.propId, text); } }, '📖 Read the case here') : null,
+        h('button', { class: 'btn slim', onclick: () => { $('#sheet-root').innerHTML = ''; go(`#/c/${c.id}?tab=${tab}${s.propId ? '&prop=' + s.propId : ''}`); } }, 'Open the case page')) : null));
   }
   await sheet('Where this sentence comes from', body, []);
 }
 
-function briefView(blocks, sources) {
+function briefView(blocks, sources, recordSources = []) {
+  const byRec = new Map();
+  for (const r0 of recordSources || []) {
+    const k = normalize(r0.text);
+    if (!byRec.has(k)) byRec.set(k, []);
+    byRec.get(k).push(r0);
+  }
   const bySent = new Map();
   for (const s of sources || []) {
     const k = normalize(s.text);
@@ -4044,6 +4158,7 @@ function briefView(blocks, sources) {
         para.append(h('span', {}, ...marker(s)));
         const src = bySent.get(normalize(s));
         if (src) para.append(' ', h('button', { class: 'srcchip', onclick: () => sourceSheet(s, src) }, '⚖'));
+        for (const rs of byRec.get(normalize(s)) || []) para.append(' ', h('button', { class: 'srcchip rec', title: rs.pin || 'Record', onclick: () => openRecordViewer(rs, s) }, '📄' + (rs.pin ? ' ' + rs.pin : '')));
       });
       wrap.append(para);
     }
@@ -4061,7 +4176,7 @@ async function viewVersion(pid, vid) {
   main.append(h('div', { class: 'row', style: 'margin-bottom:10px' },
     h('a', { class: 'btn slim primary', href: `review.html#v=${encodeURIComponent(v.id)}` }, '🔍 Review this version'),
     h('span', { class: 'small muted' }, nSrc ? `⚖ marks ${nSrc} sentence${nSrc === 1 ? '' : 's'} linked to your research — tap one to see the case and analysis.` : 'No sentences are linked to saved research yet.')));
-  main.append(briefView(v.blocks, v.sources));
+  main.append(briefView(v.blocks, v.sources, v.recordSources));
 }
 
 /* ============================== Suggestions to accept or reject ============================== */
@@ -4125,7 +4240,7 @@ async function viewSuggestions(pid, vid) {
     const cases = await projectCases(pid);
     const nv = await saveVersion(p, cases, {
       source: 'claude-suggestions', parentId: v.id, fromReviewId: sg.fromReviewId, instruction: sg.instruction, passOpts: sg.opts,
-      blocks: res.blocks, applied: res.applied, skipped: res.skipped, claudeSources: sg.sources || [],
+      blocks: res.blocks, applied: res.applied, skipped: res.skipped, claudeSources: sg.sources || [], claudeRecordSources: sg.recordSources || [],
       changeLog: accepted.map((x) => `- [${x.id}] ${SUGG_TYPES[x.type] || x.type}: ${x.comment}`).join('\n') + (sg.items.length > accepted.length ? `\n\n(${sg.items.length - accepted.length} suggestions rejected or left undecided.)` : ''),
     });
     sg.appliedVersionId = nv.id;

@@ -566,3 +566,20 @@ export function caseNameSpans(text, extraNames = []) {
   }
   return merged;
 }
+
+/**
+ * Which sentence a source refers to, when Claude's text doesn't match one sentence exactly
+ * (e.g. "Claim. (Compl. ¶ 3.)" is split into two sentences here). Returns an index or -1.
+ */
+export function matchSentence(texts, srcText) {
+  const s = normalize(srcText);
+  if (!s) return -1;
+  const ns = texts.map(normalize);
+  let i = ns.indexOf(s);
+  if (i >= 0) return i;
+  i = ns.findIndex((n) => n.length >= 15 && s.startsWith(n));
+  if (i >= 0) return i;
+  i = ns.findIndex((n) => s.length >= 15 && n.includes(s));
+  if (i >= 0) return i;
+  return ns.findIndex((n) => n.length >= 15 && s.includes(n));
+}
