@@ -310,3 +310,22 @@ dl.matter dd { margin: 0; white-space: pre-wrap; }
 .autolog .l-warn { color: var(--warn); }
 .autolog .l-error { color: var(--bad); font-weight: 600; }
 .autolog .l-done { color: var(--ok); font-weight: 700; }
+
+/* Support passages (pin cites) */
+.reader { --sup: #7c3aed; --best: #b45309; }
+.reader[data-theme="night"] { --sup: #c4b5fd; --best: #fbbf24; }
+.reader .s.sup { box-shadow: inset 0 -2px 0 var(--sup); background-color: color-mix(in srgb, var(--sup) 8%, transparent); }
+.reader .s.best { box-shadow: inset 0 -2px 0 var(--best); }
+.reader .s.flash { background-color: color-mix(in srgb, var(--sup) 25%, transparent); }
+.reader.nosup .s.sup, .reader.nosup .s.best { box-shadow: none; background-color: transparent; }
+.reader.nosup .pinchip { display: none; }
+.pinchip { font: 700 11.5px -apple-system, sans-serif; color: var(--sup); background: color-mix(in srgb, var(--sup) 12%, var(--rbg)); border: 1px solid color-mix(in srgb, var(--sup) 40%, transparent); border-radius: 999px; padding: 1px 7px; margin-right: 4px; vertical-align: .15em; cursor: pointer; -webkit-user-select: none; user-select: none; }
+.pinchip.best { color: var(--best); background: color-mix(in srgb, var(--best) 12%, var(--rbg)); border-color: color-mix(in srgb, var(--best) 40%, transparent); }
+.supbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 6px 10px; margin-bottom: 10px; }
+
+/* Suggestions */
+.card.sugg.accept { border-color: var(--ok); }
+.card.sugg.reject { opacity: .6; }
+.decide .btn.on[data-d="accept"] { background: color-mix(in srgb, var(--ok) 18%, var(--card)); border-color: var(--ok); }
+.decide .btn.on[data-d="reject"] { background: color-mix(in srgb, var(--bad) 14%, var(--card)); border-color: var(--bad); }
+.sugg-diff { padding: 12px 14px; border-radius: 10px; font-size: 16px; box-shadow: none; }

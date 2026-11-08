@@ -4,12 +4,12 @@ import { Anthropic } from './vendor/anthropic.mjs';
 import { marked } from './vendor/marked.esm.js';
 import DOMPurify from './vendor/purify.es.mjs';
 import { db, uid } from './shared/db.mjs';
-import { buildSections, blocksFromParagraphs, paragraphsFromText, blocksFromMarkup, labeledBrief, applyEdits, diffBlocks, blocksToPlainText, normalize, units } from './shared/brief.mjs';
+import { buildSections, blocksFromParagraphs, paragraphsFromText, blocksFromMarkup, labeledBrief, applyEdits, diffBlocks, diffWords, blocksToPlainText, normalize, units } from './shared/brief.mjs';
 import { extractDocxBlocks, buildDocx } from './shared/docx.mjs';
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '17';
+const APP_VERSION = '18';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -686,6 +686,7 @@ async function route() {
     if (parts[0] === 'p' && parts[2] === 'prop') return await viewProp(parts[1], parts[3]);
     if (parts[0] === 'p' && parts[2] === 'v') return await viewVersion(parts[1], parts[3]);
     if (parts[0] === 'p' && parts[2] === 'diff') return await viewDiff(parts[1], parts[3], parts[4]);
+    if (parts[0] === 'p' && parts[2] === 's') return await viewSuggestions(parts[1], parts[3]);
     if (parts[0] === 'p') return await viewProject(parts[1], q.tab || 'points', q);
     if (parts[0] === 'c') return await viewCase(parts[1], q.tab || 'read', q.prop);
     return await viewHome();
@@ -2057,7 +2058,7 @@ function segmentSentences(p, from = 0) {
   const out = [];
   const skipWs = (i) => { while (i < p.length && /\s/.test(p[i])) i++; return i; };
   let start = skipWs(from);
-  const re = /[.?!]+["”’)\]]*(?=\s+(?:["“‘(\[]?[A-Z]|\{¶|¶))/g;
+  const re = /[.?!]+["”’)\]]*(?=\s+(?:["“‘(\[]?[A-Z]|\{¶|¶|\*{1,2}\d{1,4}\s+["“(]?[A-Z]))/g;
   re.lastIndex = start;
   let m;
   while ((m = re.exec(p))) {
@@ -2114,6 +2115,99 @@ function fillSentence(span, c) {
     pos = to;
   }
   if (pos < e) appendText(span, c.text.slice(pos, e));
+}
+
+/* ---- Support passages (pin cites) ---- */
+
+/** Normalised copy of the text (lowercase, plain quotes/dashes, single spaces) with a map back to original offsets. */
+function normMap(text) {
+  let out = '';
+  const map = [];
+  let space = true;
+  for (let i = 0; i < text.length; i++) {
+    let ch = text[i];
+    if (ch === '‘' || ch === '’') ch = "'"; else if (ch === '“' || ch === '”') ch = '"'; else if (ch === '–' || ch === '—') ch = '-';
+    if (/\s/.test(ch)) { if (space) continue; ch = ' '; space = true; } else space = false;
+    out += ch.toLowerCase();
+    map.push(i);
+  }
+  return { out, map };
+}
+
+/** Find a quoted passage in the opinion, tolerating curly quotes, spacing, [a]lterations and ellipses. Returns [start, end] or null. */
+function findQuote(text, quote, nm) {
+  const { out, map } = nm || normMap(text);
+  let q = normMap(String(quote).replace(/\[\^\d+\]/g, '').replace(/\[([a-zA-Z])\]/g, '$1')).out.trim().replace(/^["'“]+|["'”]+$/g, '').trim();
+  if (q.length < 12) return null;
+  const at = (needle, from = 0) => { const i = out.indexOf(needle, from); return i < 0 ? null : [i, i + needle.length]; };
+  const toOrig = ([a, b]) => [map[a], map[b - 1] + 1];
+  let hit = at(q);
+  if (hit) return toOrig(hit);
+  const parts = q.split(/\s*(?:\.\s?\.\s?\.|…)\s*/).map((x) => x.trim()).filter((x) => x.length >= 12);
+  if (parts.length > 1) {
+    const a = at(parts[0]);
+    const b = a && at(parts[parts.length - 1], a[1]);
+    if (a && b) return toOrig([a[0], b[1]]);
+    if (a) return toOrig(a);
+  }
+  const head = at(q.slice(0, 70));
+  if (head) { const tail = at(q.slice(-50), head[1]); return toOrig([head[0], tail && tail[1] - head[0] < q.length * 2 ? tail[1] : head[1]]); }
+  return null;
+}
+
+/** Quotes from an older analysis that didn't save them separately. */
+function quotesFromAnalysis(text, ...sections) {
+  const sec = sections.map((n) => mdSection(text, n)).find(Boolean) || '';
+  const out = [];
+  for (const m of sec.matchAll(/[“"]([^”"]{25,600})[”"]/g)) out.push({ quote: m[1] });
+  for (const line of sec.split('\n')) { const m = /^>\s*(.{25,})$/.exec(line.trim()); if (m && !out.some((o) => m[1].includes(o.quote))) out.push({ quote: m[1].replace(/^["“]|["”]$/g, '') }); }
+  return out;
+}
+
+/** The passages to mark for this case: support for the pinned point, or (no point) every point's support + best quotes. */
+function supportPassages(c, p, prop) {
+  const out = [];
+  const add = (pid, sp) => {
+    if (!sp) return;
+    const qs = sp.quotes?.length ? sp.quotes : quotesFromAnalysis(sp.text, 'The exact language that helps', 'Language that helps us');
+    const point = (p.props || []).find((x) => x.id === pid);
+    for (const q of qs) out.push({ ...q, kind: 'support', propId: pid, point: point?.text || '', verdict: sp.verdict });
+  };
+  if (prop) add(prop.id, c.support?.[prop.id]);
+  else {
+    for (const [pid, sp] of Object.entries(c.support || {})) add(pid, sp);
+    if (c.breakdown) for (const q of quotesFromAnalysis(c.breakdown, 'Best quotes')) out.push({ ...q, kind: 'best' });
+  }
+  return out;
+}
+
+/** Page (*512) and ¶ for a position in the opinion. */
+function pinAt(text, pos) {
+  const star = [...text.slice(Math.max(0, pos - 30000), pos).matchAll(/\*{1,2}(\d{1,4})\b/g)].pop();
+  const ps = text.lastIndexOf('\n\n', pos);
+  const head = text.slice(ps < 0 ? 0 : ps + 2, (ps < 0 ? 0 : ps + 2) + 24);
+  const pm = head.match(PARA_MARK) || head.match(NUMBERED_PARA);
+  return [star ? '*' + star[1] : null, pm ? '¶ ' + pm[1].replace(/[{}¶\s.]/g, '') : null].filter(Boolean).join(', ');
+}
+
+/** Mark the sentences holding each passage, add a 📍 tag with its pin cite, and return the located passages. */
+function markSupport(el, c, passages) {
+  const nm = normMap(c.text);
+  const found = [];
+  const spans = [...el.querySelectorAll('.s')];
+  passages.forEach((pg) => {
+    const range = findQuote(c.text, pg.quote, nm);
+    if (!range || found.some((f) => f.range[0] === range[0])) return;
+    const hit = spans.filter((sp) => +sp.dataset.e > range[0] && +sp.dataset.s < range[1]);
+    if (!hit.length) return;
+    const idx = found.length;
+    const pin = pg.pin || pinAt(c.text, range[0]);
+    hit.forEach((sp) => { sp.classList.add(pg.kind === 'best' ? 'best' : 'sup'); sp.dataset.sup = idx; });
+    const chip = h('button', { class: 'pinchip' + (pg.kind === 'best' ? ' best' : ''), 'data-supchip': idx, title: pg.why || '' }, (pg.kind === 'best' ? '★ ' : '📍 ') + (pin || 'support'));
+    hit[0].before(chip);
+    found.push({ ...pg, range, pin, chip, spans: hit });
+  });
+  return found;
 }
 
 function renderOpinion(el, c) {
@@ -2184,6 +2278,33 @@ async function readTab(main, c, p, prop) {
   const op = h('article', { class: 'reader', id: 'opinion' });
   applyReader(op);
   renderOpinion(op, c);
+  const found = isFiling(c) ? [] : markSupport(op, c, supportPassages(c, p, prop));
+  let cur = -1;
+  const counter = h('span', { class: 'grow small' });
+  const jump = (i) => {
+    if (!found.length) return;
+    cur = (i + found.length) % found.length;
+    const f = found[cur];
+    f.chip.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    f.spans.forEach((sp) => { sp.classList.add('flash'); setTimeout(() => sp.classList.remove('flash'), 1600); });
+    counter.textContent = `Passage ${cur + 1} of ${found.length}${f.pin ? ' · ' + f.pin : ''}`;
+  };
+  const showPassage = (f) => sheet(f.kind === 'best' ? 'Best quote' : 'Where the support is', h('div', {},
+    f.kind === 'support' && f.point ? h('p', { class: 'small muted', style: 'margin-top:0' }, 'For your point: ' + f.point) : null,
+    h('blockquote', { class: 'quote' }, c.text.slice(f.range[0], f.range[1])),
+    f.pin ? h('p', {}, h('strong', {}, 'Pin cite: '), f.pin) : h('p', { class: 'small muted' }, 'No page or ¶ number appears in this copy of the opinion — get the pin from Westlaw.'),
+    f.why ? h('p', {}, f.why) : null,
+    f.verdict ? h('p', {}, verdictBadge(f.verdict)) : null), []);
+  const supBar = found.length ? h('div', { class: 'supbar' },
+    h('span', {}, '📍'), counter,
+    h('button', { class: 'btn slim', 'aria-label': 'Previous passage', onclick: () => jump(cur - 1) }, '‹'),
+    h('button', { class: 'btn slim', 'aria-label': 'Next passage', onclick: () => jump(cur + 1) }, '›'),
+    h('button', { class: 'btn slim', onclick: () => sheet('Supporting passages', h('div', { class: 'stack' }, found.map((f, i) => h('button', { class: 'pickprop', onclick: () => { $('#sheet-root').innerHTML = ''; jump(i); } },
+      h('div', { class: 'small muted' }, `${f.kind === 'best' ? '★ Best quote' : '📍 Support'}${f.pin ? ' · ' + f.pin : ''}`), cap(c.text.slice(f.range[0], f.range[1]), 220), f.why ? h('div', { class: 'small', style: 'margin-top:4px' }, f.why) : null))), []) }, 'List'),
+    h('button', { class: 'btn slim', onclick: (e) => { const off = op.classList.toggle('nosup'); e.currentTarget.textContent = off ? 'Show' : 'Hide'; } }, 'Hide'))
+    : null;
+  if (found.length) counter.textContent = `${found.length} passage${found.length === 1 ? '' : 's'} ${prop ? 'support this point' : 'flagged in your analyses'} — tap ›`;
+  else if (!isFiling(c) && (prop ? c.support?.[prop.id] : Object.keys(c.support || {}).length)) counter.textContent = '';
 
   const source = c.source ? (c.url ? h('a', { href: c.url, target: '_blank', rel: 'noopener' }, c.source + ' ↗') : c.source) : null;
   main.append(
@@ -2191,6 +2312,7 @@ async function readTab(main, c, p, prop) {
       h('div', { class: 'small muted grow' }, source ? ['Source: ', source] : null),
       h('button', { class: 'btn slim', 'aria-label': 'Text settings', onclick: textSettings }, 'Aa')),
     ...(c.fetchNote ? [h('p', { class: 'small muted' }, c.fetchNote)] : []),
+    ...(supBar ? [supBar] : []),
     op);
 
   // Reading progress bar
@@ -2215,6 +2337,8 @@ async function readTab(main, c, p, prop) {
 
   // Tap a sentence → highlight it with the current pen. Tap a highlight → options.
   op.addEventListener('click', (e) => {
+    const chip = e.target.closest('.pinchip');
+    if (chip) { const f = found[+chip.dataset.supchip]; if (f) { cur = +chip.dataset.supchip; showPassage(f); } return; }
     if (!window.getSelection().isCollapsed) return;
     const mark = e.target.closest('mark');
     if (mark) return openHighlight(c.annotations.find((x) => x.id === mark.dataset.id));
@@ -2499,7 +2623,9 @@ Start your answer with exactly one line: "VERDICT: strong", "VERDICT: partial", 
 (Different facts, posture, dicta, jurisdiction, later limits — step by step.)
 ## Language that helps us
 (Exact quotes with star pages or ¶ numbers if shown.)
-## How to distinguish it in our response` : `Does this case support this point in my brief?
+## How to distinguish it in our response
+
+Finally, end with ONE \`\`\`json block listing the passages of the opinion that matter most for this point, copied EXACTLY word-for-word from the opinion text above (one or two sentences each, no ellipses if you can avoid them, at most 6): {"support_quotes":[{"quote":"exact words from the opinion","pin":"the star page like *512 or ¶ 14 where it appears, if shown — else empty","why":"what it shows, in a few words"}]}` : `Does this case support this point in my brief?
 
 MY POINT: ${prop.text}
 SECTION: ${prop.section || ''}
@@ -2516,13 +2642,16 @@ Start your answer with exactly one line: "VERDICT: strong" or "VERDICT: partial"
 (Different facts, different procedural posture, dicta, different jurisdiction, later limits.)
 ## How to phrase my point so it's accurate to this case
 ## Suggested citation
-(Bluebook, with a short explanatory parenthetical.)` }],
+(Bluebook, with a short explanatory parenthetical.)
+
+Finally, end with ONE \`\`\`json block listing the passages of the opinion that matter most for this point, copied EXACTLY word-for-word from the opinion text above (one or two sentences each, no ellipses if you can avoid them, at most 6): {"support_quotes":[{"quote":"exact words from the opinion","pin":"the star page like *512 or ¶ 14 where it appears, if shown — else empty","why":"what it shows, in a few words"}]}` }],
   });
   const verdict = (r.text.match(/VERDICT:\s*(strong|partial|weak|none|against)/i)?.[1] || '').toLowerCase();
-  const text = r.text.replace(/^\s*VERDICT:.*\n?/i, '').trim();
+  const quotes = (lastJSON(r.text)?.support_quotes || []).filter((q) => q && typeof q.quote === 'string');
+  const text = stripJSONBlocks(r.text.replace(/^\s*VERDICT:.*\n?/i, '')).trim();
   outEl.innerHTML = md(text);
   const fresh = await db.get('cases', c.id);
-  fresh.support = { ...(fresh.support || {}), [prop.id]: { verdict, text, at: Date.now() } };
+  fresh.support = { ...(fresh.support || {}), [prop.id]: { verdict, text, quotes, at: Date.now() } };
   await save('cases', fresh);
   Object.assign(c, fresh);
   return { verdict, text };
@@ -3331,7 +3460,87 @@ const DRAFT_RULES = `You are drafting and revising a legal brief with me, inside
 2. Consider the WHOLE brief every time, not just the part you are changing. Keep terms, defined names, party names, and record citations consistent. Use a full citation the first time a case appears in the brief and short forms after (check the whole brief to see what is already cited). Don't repeat what another section already says. Make every paragraph serve the overall argument, and keep transitions and cross-references accurate.
 3. Build on my research file. My saved analyses (breakdowns, support checks, comparisons, gap research, highlights) are settled work — rely on them instead of re-analyzing. Use the read_case_text tool only to confirm a quotation or pin cite, or when the saved analyses don't cover what you need. If the research file is a summary, open the full saved analysis with read_saved_analysis before relying on its details, and open the other side's filings with read_filing when they aren't included in full. Open only what you need. Never redo an analysis unless I ask.
 4. Never invent cases, quotations, holdings, pin cites, record cites, or facts. If something is missing, write a bracketed placeholder such as [cite], [pin], or [confirm holding].
-5. Track sources: every sentence you write or change that relies on a case must be listed in "sources" with the case id and which saved analysis it came from.`;
+5. Track sources: every sentence you write or change that relies on a case must be listed in "sources" with the case id and which saved analysis it came from.
+6. Nothing is confirmed until I confirm it. Put anything you could not confirm in brackets right in the text: [confirm: …], [pin], [cite], [record cite], [confirm fact: …]. Sentences I marked CITE CHECKED in a review are confirmed by me: keep their citations exactly and don't bracket them.
+7. Never write notes or commentary to me inside the brief text (for example "this case does not fully support…"). Remarks go in the change log, in a bracket, or in a suggestion.`;
+
+const DRAFT_MODES = {
+  targeted: { label: 'Targeted', desc: { revise: 'Change only what I flagged in my review (and whatever else that requires for consistency).', change: 'Change only what my request asks for (and whatever else that requires for consistency).' } },
+  rewrite: { label: 'Full rewrite', desc: 'A complete rewrite that fully uses my research: check the citations, fix accuracy problems right in the text, restructure where it helps. Unconfirmed facts and cites get [brackets].' },
+  citecheck: { label: 'Cite check', desc: 'Check every citation and the proposition it’s cited for against my saved analyses (and the opinions when needed). Don’t rewrite — flag problems and propose fixes.' },
+  polish: { label: 'Polish', desc: 'Grammar, clarity, flow, and my manual. No changes to substance, arguments, or citations.' },
+};
+const CITE_LEVELS = { off: 'Off', light: 'Light — spot-check', thorough: 'Thorough — every cite' };
+const DRAFT_DEFAULTS = {
+  first: { mode: 'rewrite', cite: 'light', deliver: 'edits' },
+  revise: { mode: 'targeted', cite: 'light', deliver: 'edits' },
+  change: { mode: 'citecheck', cite: 'thorough', deliver: 'suggest' },
+};
+
+/** Options shown before every drafting job, starting from the baseline saved for this project. */
+async function draftOptionsSheet(p, kind, { instruction = '' } = {}) {
+  const base = { ...DRAFT_DEFAULTS[kind], ...(p.draftPrefs?.[kind] || {}) };
+  if (kind === 'change' && instruction && !p.draftPrefs?.change) { base.mode = 'targeted'; base.deliver = 'edits'; base.cite = 'light'; }
+  let deliverTouched = false;
+  let citeTouched = false;
+  const modes = kind === 'first' ? [] : Object.entries(DRAFT_MODES).filter(([k]) => k !== 'targeted' || kind === 'revise' || instruction);
+  if (!modes.some(([k]) => k === base.mode)) base.mode = modes[0]?.[0] || 'rewrite';
+  const radios = h('div', { class: 'stack' });
+  const deliver = h('div', { class: 'seg' });
+  const cite = h('div', { class: 'seg' });
+  const draw = () => {
+    radios.replaceChildren(...modes.map(([k, m]) => h('button', { class: 'pickprop' + (base.mode === k ? ' on' : ''), onclick: () => {
+      base.mode = k;
+      if (!deliverTouched) base.deliver = k === 'citecheck' ? 'suggest' : 'edits';
+      if (k === 'citecheck' && !citeTouched) base.cite = 'thorough';
+      draw();
+    } }, h('strong', {}, (base.mode === k ? '◉ ' : '○ ') + m.label), h('div', { class: 'small muted' }, typeof m.desc === 'string' ? m.desc : m.desc[kind]))));
+    cite.replaceChildren(...Object.entries(CITE_LEVELS).map(([k, l]) => h('button', { class: base.cite === k ? 'on' : '', onclick: () => { base.cite = k; citeTouched = true; draw(); } }, l)));
+    deliver.replaceChildren(
+      h('button', { class: base.deliver === 'edits' ? 'on' : '', onclick: () => { base.deliver = 'edits'; deliverTouched = true; draw(); } }, 'Make the edits'),
+      h('button', { class: base.deliver === 'suggest' ? 'on' : '', onclick: () => { base.deliver = 'suggest'; deliverTouched = true; draw(); } }, 'Suggest — I approve each'));
+  };
+  draw();
+  const remember = h('input', { type: 'checkbox', checked: true });
+  const ok = await sheet(kind === 'first' ? 'First-draft options' : kind === 'revise' ? 'Revision options' : 'What kind of pass?', h('div', {},
+    modes.length ? [h('label', { class: 'f', style: 'margin-top:0' }, 'What kind of pass'), radios] : null,
+    h('label', { class: 'f' }, 'Cite check'), cite,
+    kind === 'first' ? null : [h('label', { class: 'f' }, 'How to deliver it'), deliver,
+      h('p', { class: 'small muted' }, '“Suggest” gives you a list of proposed changes, each with the reason. You accept or reject each one, and the accepted ones become the next version.')],
+    h('p', { class: 'small', style: 'margin:12px 0 0' }, '🔒 Always on: anything not confirmed is [bracketed] in the text, and sentences you marked “Cite checked” are treated as confirmed.'),
+    h('label', { class: 'small row', style: 'gap:6px; margin-top:10px' }, remember, 'Remember these as my baseline for this project')),
+  [{ label: 'Start', run: () => true }]);
+  if (!ok) return null;
+  const opts = { mode: base.mode, cite: base.cite, deliver: kind === 'first' ? 'edits' : base.deliver };
+  if (remember.checked) {
+    const fresh = await db.get('projects', p.id);
+    fresh.draftPrefs = { ...(fresh.draftPrefs || {}), [kind]: opts };
+    await save('projects', fresh);
+    p.draftPrefs = fresh.draftPrefs;
+  }
+  return opts;
+}
+
+function passInstructions(opts, kind) {
+  const L = [];
+  if (kind !== 'first') {
+    const m = { targeted: '', rewrite: 'THIS PASS: FULL REWRITE. Rewrite the brief as needed to make the best argument my research supports: integrate my research, fix inaccurate or overstated propositions right in the text, restructure where it helps, and keep what already works. Keep my manual’s voice.', citecheck: 'THIS PASS: CITE CHECK. Your job is checking, not rewriting. Go citation by citation: is the case in my research file, does my saved analysis show it supports the exact proposition in that sentence, are quotations and pin cites right, does the signal (See, Cf., etc.) fit the strength of support? Only change wording where it is needed to make a sentence accurate to its authority.', polish: 'THIS PASS: POLISH. Improve grammar, clarity, flow, and conformity with my manual. Do not change substance, arguments, facts, or citations.' }[opts.mode];
+    if (m) L.push(m);
+  }
+  L.push({
+    off: 'CITE CHECK LEVEL: off — don’t spend effort checking citations, but never invent or change a citation without reason.',
+    light: 'CITE CHECK LEVEL: light — make sure every case you cite is in my research file and that my saved analysis supports the sentence it’s cited for; fix or flag mismatches.',
+    thorough: 'CITE CHECK LEVEL: thorough — for EVERY citation: (1) it’s in my research file; (2) my saved support check or breakdown supports that specific proposition (open the full analysis with read_saved_analysis if you only have a summary); (3) quotations and pin cites match the opinion (open it with read_case_text); (4) the signal fits. Fix or flag every problem.',
+  }[opts.cite]);
+  L.push('BRACKETS (always): anything not confirmed gets a bracket in the text — [confirm: …], [pin], [cite], [record cite], [confirm fact: …]. Sentences I marked CITE CHECKED are confirmed.');
+  return L.join('\n\n');
+}
+
+const SUGGEST_FORMAT = `HOW TO RETURN YOUR WORK
+Do not change the brief. Return suggestions I can accept or reject one at a time. The brief has an id in [brackets] before every sentence and heading.
+First write a short summary in Markdown: what you checked and the main problems you found. Then end with ONE \`\`\`json block:
+{"suggestions":[{"id":"Argument I.A ¶2 S1","type":"cite|support|accuracy|fact|style","comment":"what is wrong or could be better, and why (1–3 sentences)","replacement":"the full corrected sentence(s) as they should read — or empty if it is only a flag"}],"sources":[...same format as before...]}
+Rules: copy ids exactly (for a heading use "<section label> Heading"); one suggestion per sentence; most important first; a replacement must be the complete sentence ready to drop in, with [brackets] for anything unconfirmed. Don't suggest changes to sentences I marked CITE CHECKED unless the citation is plainly wrong.`;
 
 const EDIT_FORMAT = `HOW TO RETURN YOUR WORK
 The brief below has an id in [brackets] before every sentence, heading, and block quote. Do not retype the brief. Return only your changes, as edits that point at those ids; the app applies them and shows me the complete updated brief.
@@ -3444,7 +3653,7 @@ async function draftSystem(p, cases, userText = '') {
 
 const versionsOf = async (pid) => (await db.byIndex('versions', 'projectId', pid)).sort((a, b) => a.n - b.n);
 const reviewsOf = async (pid) => (await db.byIndex('reviews', 'projectId', pid)).sort((a, b) => (a.round || 1) - (b.round || 1));
-const SOURCE_LABELS = { upload: 'Your upload', 'from-project-draft': 'The draft you added to this project', 'claude-first': 'Claude’s first draft', 'claude-revision': 'Revised from your review', 'claude-change': 'Your requested change' };
+const SOURCE_LABELS = { 'claude-suggestions': 'Suggestions you accepted', upload: 'Your upload', 'from-project-draft': 'The draft you added to this project', 'claude-first': 'Claude’s first draft', 'claude-revision': 'Revised from your review', 'claude-change': 'Your requested change' };
 
 /** Link sentences that cite a project case (by citation or "X v." name) to that case's saved analysis. */
 function citationSources(blocks, cases, props) {
@@ -3517,7 +3726,7 @@ function lockedFromReview(rv) {
 
 let draftJob = null; // { pid, label, el } while Claude is working
 
-async function runDraftJob(p, kind, { version, review, instruction, outEl }) {
+async function runDraftJob(p, kind, { version, review, instruction, outEl, opts = { mode: kind === 'first' ? 'rewrite' : 'targeted', cite: 'light', deliver: 'edits' } }) {
   if (draftJob) { toast('Claude is still working on the last request'); return null; }
   const cases = await projectCases(p.id);
   draftJob = { pid: p.id, label: kind };
@@ -3531,13 +3740,23 @@ WHAT IT IS / MY INSTRUCTIONS: ${instruction || 'A brief on the points in my rese
 Use the points in my research file as the backbone, in order, and build on the paragraphs I have already written for points (bring them in line with the manual and the whole brief). Use only cases from my research file; where a point still needs authority, write [cite] and say so in your notes.
 ${p.draft ? `\nMy earlier draft, for reference (keep what works):\n<earlier_draft>\n${p.draft}\n</earlier_draft>\n` : ''}
 FORMAT: write the whole brief between <brief> and </brief>. Put "# " before every heading line, a blank line between paragraphs, "> " before each block quote, footnote markers like [^1] in the text, and the footnote bodies as "[^1]: text" lines at the end. Start with the first heading (no caption) unless I asked for one.
+${passInstructions(opts, 'first')}
+
 After </brief>, write "## Notes" with what is still missing ([cite] placeholders), assumptions you made, and suggestions. Then end with ONE \`\`\`json block: {"sources":[{"text":"exact sentence","case_id":"...","analysis":"support|breakdown|compare|gaps|better|paragraph|chat|text","point_id":"..."}]}`;
     } else {
       const header = `THE CURRENT BRIEF (version ${version.n}), with ids:\n<brief>\n${labeledBrief(version.blocks)}\n</brief>`;
+      const fmt = opts.deliver === 'suggest' ? SUGGEST_FORMAT : EDIT_FORMAT;
+      const pass = passInstructions(opts, kind);
       if (kind === 'revise') {
-        user = `${header}\n\nMY REVIEW FEEDBACK (round ${review.round}):\n<feedback>\n${review.submitted.text}\n</feedback>\n\nRevise only what I flagged: RED sentences, YELLOW sentences, my sentence comments, and my section notes. Leave everything else exactly as it is, except small changes elsewhere that your edits require for consistency (list those in the change log too). Follow my manual. Consider the whole brief.\n\n${EDIT_FORMAT}`;
+        const scope = opts.mode === 'targeted'
+          ? 'Revise only what I flagged: RED sentences, YELLOW sentences, cite-check flags, my sentence comments, and my section notes. Leave everything else exactly as it is, except small changes elsewhere that your edits require for consistency (list those too).'
+          : 'Address everything I flagged (RED, YELLOW, cite-check flags, comments, section notes), and also carry out the pass below across the whole brief.';
+        user = `${header}\n\nMY REVIEW FEEDBACK (round ${review.round}):\n<feedback>\n${review.submitted.text}\n</feedback>\n\n${scope} Follow my manual. Consider the whole brief.\n\n${pass}\n\n${fmt}`;
       } else {
-        user = `${header}\n\nMY REQUEST: ${instruction}\n\nMake the changes this request needs, plus anything elsewhere that's needed to keep the brief consistent (list those in the change log). Leave the rest exactly as it is. Follow my manual. Consider the whole brief.\n\n${EDIT_FORMAT}`;
+        const scope = opts.mode === 'targeted'
+          ? 'Make the changes this request needs, plus anything elsewhere that’s needed to keep the brief consistent. Leave the rest exactly as it is.'
+          : 'Carry out the pass below across the whole brief.';
+        user = `${header}\n\n${instruction ? `MY REQUEST: ${instruction}\n\n` : ''}${scope} Follow my manual. Consider the whole brief.\n\n${pass}\n\n${fmt}`;
       }
     }
     const fitted = await draftSystem(p, cases, user);
@@ -3559,13 +3778,25 @@ After </brief>, write "## Notes" with what is still missing ([cite] placeholders
       const blocks = blocksFromMarkup(m[1]);
       const notes = stripJSONBlocks(r.text.slice(r.text.indexOf('</brief>') + 8)).trim();
       v = await saveVersion(p, cases, { source: 'claude-first', instruction, blocks, changeLog: notes, claudeSources: json.sources || [], carrySources: false });
+    } else if (opts.deliver === 'suggest') {
+      if (!Array.isArray(json.suggestions)) throw new Error('Claude’s reply didn’t include a list of suggestions. Try again.');
+      const fresh = await db.get('versions', version.id);
+      fresh.suggestions = {
+        at: Date.now(), kind, opts, fromReviewId: review?.id || null, instruction: instruction || '',
+        summary: stripJSONBlocks(r.text),
+        items: json.suggestions.filter((x) => x && x.id).map((x) => ({ key: uid(), id: String(x.id).replace(/^\[|\]$/g, ''), type: x.type || 'accuracy', comment: x.comment || '', replacement: x.replacement || '', decision: null })),
+        sources: json.sources || [],
+      };
+      await db.put('versions', fresh);
+      if (review) { review.suggestedOn = version.id; await db.put('reviews', review); }
+      return { suggestedOn: fresh };
     } else {
       if (!Array.isArray(json.edits)) throw new Error('Claude’s reply didn’t include a list of edits, so nothing was changed. Try again.');
       const locked = kind === 'revise' ? lockedFromReview(review) : new Set();
       const res = applyEdits(version.blocks, json.edits, { locked });
       v = await saveVersion(p, cases, {
         source: kind === 'revise' ? 'claude-revision' : 'claude-change',
-        parentId: version.id, fromReviewId: review?.id || null, instruction: instruction || '',
+        parentId: version.id, fromReviewId: review?.id || null, instruction: instruction || '', passOpts: opts,
         blocks: res.blocks, changeLog: stripJSONBlocks(r.text), applied: res.applied, skipped: res.skipped,
         claudeSources: json.sources || [],
       });
@@ -3644,6 +3875,11 @@ async function draftTab(main, p, q) {
     jobCard.scrollIntoView({ block: 'start', behavior: 'smooth' });
     try {
       const v = await runDraftJob(p, kind, { ...opts, outEl: jobOut });
+      if (v?.suggestedOn) {
+        toast(`${v.suggestedOn.suggestions.items.length} suggestions ready to review`);
+        go(`#/p/${p.id}/s/${v.suggestedOn.id}`);
+        return;
+      }
       if (v) {
         toast(`Version ${v.n} is ready`);
         if (location.hash.includes(`/p/${p.id}`)) go(`#/p/${p.id}?tab=draft`);
@@ -3674,8 +3910,10 @@ async function draftTab(main, p, q) {
     const t = h('textarea', { placeholder: 'e.g., Memorandum in support of Defendant’s motion to dismiss under Civ.R. 12(B)(6); about 15 pages; lead with the standing argument.' });
     const ok = await sheet('Claude’s first draft', h('div', {},
       h('p', { class: 'small muted', style: 'margin-top:0' }, 'Claude writes from your points, the paragraphs you’ve written, and your research file, following your manual.'),
-      h('label', { class: 'f' }, 'What should it be?'), t), [{ label: 'Write it', run: () => true }]);
-    if (ok) run('first', { instruction: t.value.trim() });
+      h('label', { class: 'f' }, 'What should it be?'), t), [{ label: 'Next', run: () => true }]);
+    if (!ok) return;
+    const o = await draftOptionsSheet(p, 'first');
+    if (o) run('first', { instruction: t.value.trim(), opts: o });
   }
 
   // ---- Current version
@@ -3684,8 +3922,11 @@ async function draftTab(main, p, q) {
   const cur = h('div', { class: 'card' },
     h('div', { class: 'row' }, h('h3', { class: 'grow', style: 'margin:0' }, `Version ${latest.n}`), h('span', { class: 'badge' }, SOURCE_LABELS[latest.source] || latest.source)),
     h('div', { class: 'small muted', style: 'margin:4px 0 10px' }, new Date(latest.createdAt).toLocaleString(), rv ? ` · Round ${rv.round} review ${rv.submitted ? 'submitted' : 'in progress'}` : ' · not reviewed yet'));
-  if (pending && pending.versionId === latest.id) {
-    cur.append(h('button', { class: 'btn primary big', onclick: () => run('revise', { version: latest, review: pending }) }, `✏️ Revise from your Round ${pending.round} review`));
+  const sugg = latest.suggestions && !latest.suggestions.appliedVersionId ? latest.suggestions : null;
+  if (sugg) {
+    cur.append(h('button', { class: 'btn primary big', onclick: () => go(`#/p/${p.id}/s/${latest.id}`) }, `🧐 Review ${sugg.items.length} suggestion${sugg.items.length === 1 ? '' : 's'} (${sugg.items.filter((x) => x.decision).length} decided)`));
+  } else if (pending && pending.versionId === latest.id) {
+    cur.append(h('button', { class: 'btn primary big', onclick: async () => { const o = await draftOptionsSheet(p, 'revise'); if (o) run('revise', { version: latest, review: pending, opts: o }); } }, `✏️ Revise from your Round ${pending.round} review`));
   } else {
     cur.append(h('a', { class: 'btn primary big', href: `review.html#v=${encodeURIComponent(latest.id)}` }, rv && !rv.submitted ? `🔍 Continue reviewing v${latest.n}` : `🔍 Review v${latest.n}`));
   }
@@ -3701,11 +3942,18 @@ async function draftTab(main, p, q) {
   main.append(cur, jobCard);
 
   // ---- Ask for a change
-  const ask = h('textarea', { placeholder: 'e.g., Tighten the Introduction to one page. · Draft Section II.B from my research on the standing point. · Make the Conclusion two sentences.' });
+  const ask = h('textarea', { placeholder: 'Optional: what you want, e.g., Tighten the Introduction to one page. · Draft Section II.B from my standing research. · Leave blank to run a cite check, rewrite, or polish pass.' });
   main.append(h('div', { class: 'card' },
-    h('h3', {}, 'Ask for a change'),
+    h('h3', {}, 'Work on this draft'),
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'Ask for a specific change, or run a full rewrite, a cite check, or a polish pass. You’ll pick the options before it starts.'),
     ask,
-    h('button', { class: 'btn big', style: 'margin-top:8px', onclick: () => { if (!ask.value.trim()) return toast('Say what to change'); run('change', { version: latest, instruction: ask.value.trim() }); } }, '✨ Make this change (new version)')));
+    h('button', { class: 'btn big', style: 'margin-top:8px', onclick: async () => {
+      const instruction = ask.value.trim();
+      const o = await draftOptionsSheet(p, 'change', { instruction });
+      if (!o) return;
+      if (o.mode === 'targeted' && !instruction) return toast('Write what to change, or pick another kind of pass');
+      run('change', { version: latest, instruction, opts: o });
+    } }, '✨ Start…')));
 
   // ---- History
   main.append(h('div', { class: 'section-title' }, 'All versions'));
@@ -3738,7 +3986,9 @@ async function draftTab(main, p, q) {
     const r = rvs.find((x) => x.id === q.revise);
     const v = r && vs.find((x) => x.id === r.versionId);
     history.replaceState(null, '', `#/p/${p.id}?tab=draft`);
-    if (r && v && r.submitted && !r.revisedVersionId) run('revise', { version: v, review: r });
+    if (r && v && r.submitted && !r.revisedVersionId) {
+      draftOptionsSheet(p, 'revise').then((o) => { if (o) run('revise', { version: v, review: r, opts: o }); });
+    }
   }
 }
 
@@ -3760,9 +4010,11 @@ async function sourceSheet(text, list) {
       else ex = c.breakdown || '';
     }
     const tab = s.kind === 'support' ? 'support' : ['compare', 'gaps'].includes(s.kind) ? 'compare' : ['breakdown', 'better'].includes(s.kind) ? 'breakdown' : 'read';
+    const savedAt = c && (s.kind === 'support' ? c.support?.[s.propId]?.at : null);
     body.append(h('div', { class: 'card' },
       h('strong', {}, c ? caseTitle(c) : s.caseName || 'Case'), c?.citation ? h('div', { class: 'small muted' }, c.citation) : null,
-      h('div', { class: 'small muted' }, 'From: ' + (ANALYSIS_LABELS[s.kind] || s.kind)),
+      h('div', { class: 'small muted' }, 'From: ' + (ANALYSIS_LABELS[s.kind] || s.kind) + (savedAt ? `, saved ${new Date(savedAt).toLocaleDateString()}` : '')),
+      h('div', { class: 'small note' }, 'This is your saved research about the case (it may have been written for an earlier draft). It is not a comment on this sentence. For a check of the current draft, run a Cite check pass.'),
       ex ? h('details', { style: 'margin-top:6px' }, h('summary', {}, 'Show the saved analysis'), mdEl(ex)) : null,
       c ? h('button', { class: 'btn slim', style: 'margin-top:8px', onclick: () => { $('#sheet-root').innerHTML = ''; go(`#/c/${c.id}?tab=${tab}${s.propId ? '&prop=' + s.propId : ''}`); } }, 'Open the case') : null));
   }
@@ -3810,6 +4062,78 @@ async function viewVersion(pid, vid) {
     h('a', { class: 'btn slim primary', href: `review.html#v=${encodeURIComponent(v.id)}` }, '🔍 Review this version'),
     h('span', { class: 'small muted' }, nSrc ? `⚖ marks ${nSrc} sentence${nSrc === 1 ? '' : 's'} linked to your research — tap one to see the case and analysis.` : 'No sentences are linked to saved research yet.')));
   main.append(briefView(v.blocks, v.sources));
+}
+
+/* ============================== Suggestions to accept or reject ============================== */
+
+const SUGG_TYPES = { cite: 'Citation', support: 'Support', accuracy: 'Accuracy', fact: 'Fact', style: 'Style' };
+
+async function viewSuggestions(pid, vid) {
+  const p = await db.get('projects', pid);
+  const v = await db.get('versions', vid);
+  const sg = v?.suggestions;
+  if (!p || !sg) return go(`#/p/${pid}?tab=draft`);
+  const main = h('main', {});
+  app.replaceChildren(header('Suggestions', `#/p/${pid}?tab=draft`, `${p.name} · on version ${v.n}`), main);
+  const textOf = new Map([...units(buildSections(v.blocks))].map((u) => [u.id, u.text]));
+  const persist = async () => { const fresh = await db.get('versions', vid); fresh.suggestions = sg; await db.put('versions', fresh); };
+  const tally = h('div', { class: 'small muted' });
+  const applyBtn = h('button', { class: 'btn primary big', onclick: apply });
+  const refresh = () => {
+    const a = sg.items.filter((x) => x.decision === 'accept').length;
+    const rj = sg.items.filter((x) => x.decision === 'reject').length;
+    tally.textContent = `${sg.items.length} suggestions · ${a} accepted · ${rj} rejected · ${sg.items.length - a - rj} undecided`;
+    applyBtn.textContent = sg.appliedVersionId ? '✓ Applied — open the new version' : `Apply ${a} accepted → version ${v.n + 1}`;
+    applyBtn.disabled = !sg.appliedVersionId && !a;
+  };
+  main.append(h('div', { class: 'card' },
+    h('div', { class: 'small muted' }, `${DRAFT_MODES[sg.opts?.mode]?.label || 'Pass'} · cite check: ${CITE_LEVELS[sg.opts?.cite] || '—'} · ${new Date(sg.at).toLocaleString()}`),
+    sg.instruction ? h('p', { class: 'small' }, `Your request: “${sg.instruction}”`) : null,
+    sg.summary ? h('details', {}, h('summary', {}, 'Claude’s summary'), mdEl(sg.summary)) : null,
+    tally,
+    h('div', { class: 'row', style: 'margin-top:8px' },
+      h('button', { class: 'btn slim', onclick: async () => { sg.items.forEach((x) => { x.decision = 'accept'; }); await persist(); route(); } }, 'Accept all'),
+      h('button', { class: 'btn slim', onclick: async () => { sg.items.forEach((x) => { x.decision = 'reject'; }); await persist(); route(); } }, 'Reject all'))));
+  for (const it of sg.items) {
+    const current = textOf.get(it.id);
+    const card = h('div', { class: 'card sugg' + (it.decision ? ' ' + it.decision : '') });
+    const set = async (d) => { it.decision = it.decision === d ? null : d; await persist(); card.className = 'card sugg' + (it.decision ? ' ' + it.decision : ''); card.querySelectorAll('.decide button').forEach((b) => b.classList.toggle('on', b.dataset.d === it.decision)); refresh(); };
+    card.append(...[
+      h('div', { class: 'row' }, h('span', { class: 'badge' }, SUGG_TYPES[it.type] || it.type), h('span', { class: 'small muted grow' }, `[${it.id}]`)),
+      h('p', { style: 'margin:8px 0' }, it.comment),
+      current == null ? h('p', { class: 'small err' }, 'This sentence id wasn’t found in the version, so this one can’t be applied.') : null,
+      it.replacement && current != null
+        ? h('div', { class: 'reader redline sugg-diff' }, diffWords(current, it.replacement).map((w) => (w.t === 'same' ? w.s : h(w.t === 'ins' ? 'ins' : 'del', {}, w.s))))
+        : current != null ? h('div', { class: 'reader sugg-diff' }, current, h('div', { class: 'small muted' }, 'Flag only — accepting adds a [bracketed] note after this sentence.')) : null,
+      h('div', { class: 'row decide', style: 'margin-top:8px' },
+        h('button', { class: 'btn slim' + (it.decision === 'accept' ? ' on' : ''), 'data-d': 'accept', onclick: () => set('accept') }, '✓ Accept'),
+        h('button', { class: 'btn slim' + (it.decision === 'reject' ? ' on' : ''), 'data-d': 'reject', onclick: () => set('reject') }, '✗ Reject'))].filter(Boolean));
+    applyReader(card.querySelector('.reader') || h('div'));
+    main.append(card);
+  }
+  main.append(applyBtn);
+  refresh();
+
+  async function apply() {
+    if (sg.appliedVersionId) return go(`#/p/${pid}/v/${sg.appliedVersionId}`);
+    const accepted = sg.items.filter((x) => x.decision === 'accept' && textOf.has(x.id));
+    const edits = accepted.map((x) => {
+      if (/ Heading$/.test(x.id)) return x.replacement ? { op: 'replace_heading', id: x.id.replace(/ Heading$/, ''), text: x.replacement } : null;
+      return { op: 'replace_sentence', id: x.id, text: x.replacement || `${textOf.get(x.id)} [${x.type === 'cite' || x.type === 'support' ? 'confirm cite' : 'confirm'}: ${x.comment}]` };
+    }).filter(Boolean);
+    const res = applyEdits(v.blocks, edits);
+    const cases = await projectCases(pid);
+    const nv = await saveVersion(p, cases, {
+      source: 'claude-suggestions', parentId: v.id, fromReviewId: sg.fromReviewId, instruction: sg.instruction, passOpts: sg.opts,
+      blocks: res.blocks, applied: res.applied, skipped: res.skipped, claudeSources: sg.sources || [],
+      changeLog: accepted.map((x) => `- [${x.id}] ${SUGG_TYPES[x.type] || x.type}: ${x.comment}`).join('\n') + (sg.items.length > accepted.length ? `\n\n(${sg.items.length - accepted.length} suggestions rejected or left undecided.)` : ''),
+    });
+    sg.appliedVersionId = nv.id;
+    await persist();
+    if (sg.fromReviewId) { const rv = await db.get('reviews', sg.fromReviewId); if (rv) { rv.revisedVersionId = nv.id; await db.put('reviews', rv); } }
+    toast(`Version ${nv.n} created from ${accepted.length} accepted suggestions`);
+    go(`#/p/${pid}?tab=draft`);
+  }
 }
 
 /* ============================== Redline between versions ============================== */

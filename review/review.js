@@ -14,6 +14,13 @@ const COLORS = {
   yellow: { label: 'Mixed / needs refinement', short: 'Yellow', glyph: '~' },
   red: { label: 'Revise', short: 'Red', glyph: '✗' },
 };
+// Cite-check layer (separate from the style colors above).
+const CITES = {
+  ok: { label: 'Cite checked — good to go', short: 'Cite checked', glyph: '✔' },
+  confirm: { label: 'Confirm the cite (pin, quote, or holding)', short: 'Confirm cite', glyph: '?' },
+  support: { label: 'Needs better support', short: 'Needs better support', glyph: '+' },
+  none: { label: 'No cite needed', short: 'No cite needed', glyph: '∅' },
+};
 const RATINGS = {
   like: { label: 'Like', glyph: '👍' },
   mixed: { label: 'Mixed', glyph: '〰️' },
@@ -30,7 +37,7 @@ const main = $('#main');
 // ---------------------------------------------------------------- storage
 
 function loadPrefs() {
-  try { return { tool: 'green', showChanges: true, currentId: null, ...JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') }; }
+  try { return { tool: 'green', citeTool: 'ok', mode: 'style', showChanges: true, currentId: null, ...JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') }; }
   catch { return { tool: 'green', showChanges: true, currentId: null }; }
 }
 const prefs = loadPrefs();
@@ -152,6 +159,7 @@ function createReview(name, blocks, extra = {}) {
     structured,
     sections: sections.map((s) => ({ id: s.id, label: s.label, title: s.title, kind: s.kind, heading: s.heading, items: s.items.map((it) => ({ type: it.type, text: it.text, id: it.id, n: it.n, sentences: it.sentences, sids: it.sids })) })),
     marks: {},
+    cites: {},
     comments: {},
     notes: {},
     ratings: {},
@@ -187,10 +195,12 @@ function applyCarryOver(prev, next) {
       if (prev.notes[old.label] || prev.ratings[old.label]) next.prev[sec.label] = { round: prev.round, notes: prev.notes[old.label] || '', rating: prev.ratings[old.label] || null };
     }
     const prior = new Map();
+    const priorCite = new Map();
     if (old) {
       for (const it of old.items) (it.sentences || []).forEach((text, j) => {
         const n = normalize(text);
         if (!prior.has(n)) prior.set(n, prev.marks[it.sids[j]] || null);
+        if (prev.cites?.[it.sids[j]] && !priorCite.has(n)) priorCite.set(n, prev.cites[it.sids[j]]);
       });
     }
     for (const it of sec.items) (it.sentences || []).forEach((text, j) => {
@@ -200,6 +210,8 @@ function applyCarryOver(prev, next) {
         if (old || prev.sections.length) { next.changes[k] = 'new'; changed++; }
         return;
       }
+      const pc = priorCite.get(n);
+      if (pc === 'ok' || pc === 'none') { (next.cites ||= {})[k] = pc; }
       const color = prior.get(n);
       if (color === 'green') { next.marks[k] = 'green'; next.carried[k] = true; carried++; }
       else if (color === 'red' || color === 'yellow') { next.changes[k] = `unrevised-${color}`; unrevised++; }
@@ -338,7 +350,7 @@ function importBackup(text) {
   try { obj = JSON.parse(text); } catch { throw new Error('That .json file is not a review backup.'); }
   const rev = obj && (obj.format === 'casereview-review' || obj.format === 'reviewbuddy-review') ? obj.review : null;
   if (!rev || !Array.isArray(rev.sections) || !rev.sections.every((s) => Array.isArray(s.items))) throw new Error('That .json file is not a Case Review backup.');
-  for (const f of ['marks', 'comments', 'notes', 'ratings', 'carried', 'changes', 'quoteChanged', 'prev', 'sources']) rev[f] = rev[f] || {};
+  for (const f of ['marks', 'cites', 'comments', 'notes', 'ratings', 'carried', 'changes', 'quoteChanged', 'prev', 'sources']) rev[f] = rev[f] || {};
   if (store.reviews[rev.id] && !confirm(`Replace the saved copy of “${rev.docName}” with this backup?`)) return;
   rev.id = rev.id || uid();
   commitReview(rev);
@@ -404,13 +416,17 @@ function counts(rev, secId = null) {
   let total = 0;
   let marked = 0;
   const by = { green: 0, yellow: 0, red: 0 };
+  const cite = { ok: 0, confirm: 0, support: 0, none: 0 };
+  let cited = 0;
   for (const x of sentences(rev, secId == null)) {
     if (secId != null && x.sec.id !== secId) continue;
     total++;
     const m = rev.marks[x.key];
     if (m) { marked++; by[m]++; }
+    const cm = rev.cites?.[x.key];
+    if (cm) { cited++; cite[cm]++; }
   }
-  return { total, marked, by };
+  return { total, marked, by, cite, cited };
 }
 
 function renderSavedList() {
@@ -462,24 +478,34 @@ function renderRoundBanner() {
 }
 
 function renderLegend() {
+  const cite = prefs.mode === 'cite';
   return h('div', { class: 'legend' },
-    h('span', {}, 'Pick a color beside any paragraph, then tap sentences:'),
-    h('span', { class: 'lg green' }, '✓ Keep'),
-    h('span', { class: 'lg yellow' }, '~ Refine'),
-    h('span', { class: 'lg red' }, '✗ Revise'),
-    h('span', { class: 'lg' }, '✎ Comment'),
-    h('span', { class: 'lg' }, '⚖ Source'));
+    h('div', { class: 'modeswitch', role: 'radiogroup', 'aria-label': 'What you are marking' },
+      h('button', { type: 'button', 'data-mode': 'style', 'aria-checked': String(!cite), role: 'radio' }, '✍️ Style & writing'),
+      h('button', { type: 'button', 'data-mode': 'cite', 'aria-checked': String(cite), role: 'radio' }, '⚖ Cite check')),
+    cite
+      ? [h('span', {}, 'Tap sentences to mark cite checking:'),
+        ...Object.entries(CITES).map(([k, v]) => h('span', { class: `lg cite-lg ${k}` }, `${v.glyph} ${v.short}`)),
+        h('span', { class: 'lg' }, '✎ Comment')]
+      : [h('span', {}, 'Pick a color beside any paragraph, then tap sentences:'),
+        h('span', { class: 'lg green' }, '✓ Keep'),
+        h('span', { class: 'lg yellow' }, '~ Refine'),
+        h('span', { class: 'lg red' }, '✗ Revise'),
+        h('span', { class: 'lg' }, '✎ Comment'),
+        h('span', { class: 'lg' }, '⚖ Source')]);
 }
 
 function renderTools(spec, label) {
   const tools = h('div', { class: 'tools', role: 'toolbar', 'aria-label': `${label} highlighter` },
     h('span', { class: 'pnum' }, label));
-  for (const [c, info] of Object.entries(COLORS)) {
-    tools.append(h('button', { class: `tool ${c}`, type: 'button', 'data-tool': c, 'aria-label': info.label, title: info.label, 'aria-pressed': String(prefs.tool === c) }, info.glyph));
+  const cite = prefs.mode === 'cite';
+  const active = cite ? prefs.citeTool : prefs.tool;
+  for (const [c, info] of Object.entries(cite ? CITES : COLORS)) {
+    tools.append(h('button', { class: `tool ${cite ? 'cite ' : ''}${c}`, type: 'button', 'data-tool': c, 'aria-label': info.label, title: info.label, 'aria-pressed': String(active === c) }, info.glyph));
   }
   tools.append(
-    h('button', { class: 'tool erase', type: 'button', 'data-tool': 'erase', 'aria-label': 'Clear highlight', title: 'Clear highlight', 'aria-pressed': String(prefs.tool === 'erase') }, '⌫'),
-    h('button', { class: 'tool comment', type: 'button', 'data-tool': 'comment', 'aria-label': 'Add a comment to a sentence', title: 'Comment on a sentence', 'aria-pressed': String(prefs.tool === 'comment') }, '✎'),
+    h('button', { class: 'tool erase', type: 'button', 'data-tool': 'erase', 'aria-label': cite ? 'Clear cite mark' : 'Clear highlight', title: 'Clear', 'aria-pressed': String(active === 'erase') }, '⌫'),
+    h('button', { class: 'tool comment', type: 'button', 'data-tool': 'comment', 'aria-label': 'Add a comment to a sentence', title: 'Comment on a sentence', 'aria-pressed': String(active === 'comment') }, '✎'),
     h('button', { class: 'tool all', type: 'button', 'data-all': spec, title: 'Apply the selected color to the whole paragraph' }, 'All'));
   return tools;
 }
@@ -490,6 +516,8 @@ function sentenceClass(k) {
   if (m) c.push(`m-${m}`);
   if (review.comments[k]) c.push('has-comment');
   if (review.carried[k]) c.push('carried');
+  const cm = review.cites?.[k];
+  if (cm) c.push(`cite-${cm}`);
   const ch = review.changes[k];
   if (ch === 'new') c.push('chg-new');
   else if (ch) c.push('chg-unrev');
@@ -580,10 +608,11 @@ $('#jump').addEventListener('change', (e) => {
 function updateSectionStats(sec) {
   const el = document.getElementById(`stats-${sec.id}`);
   if (!el) return;
-  const { total, marked, by } = counts(review, sec.id);
+  const { total, marked, by, cite, cited } = counts(review, sec.id);
   const r = review.ratings[sec.label];
   el.replaceChildren(...[
     h('span', { class: 'count' }, `${marked}/${total}`),
+    ...Object.entries(cite).filter(([, n]) => n).map(([k, n]) => h('span', { class: `pill cite-pill ${k}` }, `${CITES[k].glyph}${n}`)),
     by.green ? h('span', { class: 'pill green' }, `✓${by.green}`) : null,
     by.yellow ? h('span', { class: 'pill yellow' }, `~${by.yellow}`) : null,
     by.red ? h('span', { class: 'pill red' }, `✗${by.red}`) : null,
@@ -593,10 +622,10 @@ function updateSectionStats(sec) {
 function updateProgress() {
   if (!review) return;
   for (const sec of review.sections) updateSectionStats(sec);
-  const { total, marked } = counts(review);
+  const { total, marked, cited } = counts(review);
   const secs = review.sections.filter((s) => isCounted(review, s));
   const rated = secs.filter((s) => review.ratings[s.label]).length;
-  $('#progress').textContent = `${marked}/${total} sentences · ${rated}/${secs.length} rated`;
+  $('#progress').textContent = `${marked}/${total} sentences · ${rated}/${secs.length} rated${cited ? ` · ${cited} cite-checked` : ''}`;
 }
 
 function refreshSentence(k) {
@@ -607,19 +636,20 @@ function refreshSentence(k) {
 // ---------------------------------------------------------------- interactions
 
 function setTool(tool) {
-  prefs.tool = tool;
+  if (prefs.mode === 'cite') prefs.citeTool = tool; else prefs.tool = tool;
   for (const b of main.querySelectorAll('.tool[data-tool]')) b.setAttribute('aria-pressed', String(b.dataset.tool === tool));
   savePrefs();
 }
 
-function setMarks(changes) {
+function setMarks(changes, field = 'marks') {
   const undo = [];
+  const layer = (review[field] ||= {});
   for (const { k, color } of changes) {
-    const before = review.marks[k] || null;
+    const before = layer[k] || null;
     if (before === color) continue;
-    undo.push({ k, color: before, carried: !!review.carried[k] });
-    if (color) review.marks[k] = color; else delete review.marks[k];
-    delete review.carried[k];
+    undo.push({ k, color: before, carried: !!review.carried[k], field });
+    if (color) layer[k] = color; else delete layer[k];
+    if (field === 'marks') delete review.carried[k];
     refreshSentence(k);
   }
   if (!undo.length) return;
@@ -633,9 +663,10 @@ function setMarks(changes) {
 function undo() {
   const last = undoStack.pop();
   if (!last) return;
-  for (const { k, color, carried } of last) {
-    if (color) review.marks[k] = color; else delete review.marks[k];
-    if (carried) review.carried[k] = true;
+  for (const { k, color, carried, field = 'marks' } of last) {
+    const layer = (review[field] ||= {});
+    if (color) layer[k] = color; else delete layer[k];
+    if (carried && field === 'marks') review.carried[k] = true;
     refreshSentence(k);
   }
   updateUndo();
@@ -647,11 +678,12 @@ function updateUndo() { $('#btn-undo').disabled = !undoStack.length; }
 
 function onSentence(el) {
   const k = el.dataset.k;
-  const tool = prefs.tool;
+  const field = prefs.mode === 'cite' ? 'cites' : 'marks';
+  const tool = field === 'cites' ? prefs.citeTool : prefs.tool;
   if (tool === 'comment') return openComment(k);
-  if (tool === 'erase') return setMarks([{ k, color: null }]);
-  const cur = review.marks[k] || null;
-  setMarks([{ k, color: cur === tool ? null : tool }]);
+  if (tool === 'erase') return setMarks([{ k, color: null }], field);
+  const cur = review[field]?.[k] || null;
+  setMarks([{ k, color: cur === tool ? null : tool }], field);
 }
 
 function onAll(spec) {
@@ -659,14 +691,18 @@ function onAll(spec) {
   const sec = review.sections.find((s) => s.id === secId);
   const it = sec && sec.items[+idx];
   if (!it || !it.sids) return;
-  let color = prefs.tool === 'erase' || prefs.tool === 'comment' ? null : prefs.tool;
-  if (color && it.sids.every((k) => review.marks[k] === color)) color = null;
-  setMarks(it.sids.map((k) => ({ k, color })));
+  const field = prefs.mode === 'cite' ? 'cites' : 'marks';
+  const tool = field === 'cites' ? prefs.citeTool : prefs.tool;
+  let color = tool === 'erase' || tool === 'comment' ? null : tool;
+  if (color && it.sids.every((k) => review[field]?.[k] === color)) color = null;
+  setMarks(it.sids.map((k) => ({ k, color })), field);
 }
 
 main.addEventListener('click', (e) => {
   if (!review) return;
   const t = e.target;
+  const mode = t.closest('[data-mode]');
+  if (mode) { prefs.mode = mode.dataset.mode; savePrefs(); const y = scrollY; render(); scrollTo(0, y); return; }
   const tool = t.closest('.tool[data-tool]');
   if (tool) return setTool(tool.dataset.tool);
   const all = t.closest('[data-all]');
@@ -773,7 +809,8 @@ async function openSources(k) {
     const tab = s.kind === 'support' ? 'support' : s.kind === 'compare' || s.kind === 'gaps' ? 'compare' : s.kind === 'breakdown' || s.kind === 'better' ? 'breakdown' : 'read';
     body.append(h('div', { class: 'src-card' },
       h('strong', {}, name), c?.citation && c.name ? h('div', { class: 'hint' }, c.citation) : null,
-      h('div', { class: 'hint' }, `From: ${ANALYSIS_LABELS[s.kind] || s.kind}`),
+      h('div', { class: 'hint' }, `From: ${ANALYSIS_LABELS[s.kind] || s.kind}${s.kind === 'support' && c?.support?.[s.propId]?.at ? `, saved ${new Date(c.support[s.propId].at).toLocaleDateString()}` : ''}`),
+      h('div', { class: 'hint' }, 'Your saved research about the case (possibly from an earlier draft), not a comment on this sentence.'),
       ex ? h('p', { class: 'src-ex' }, ex) : h('p', { class: 'hint' }, c ? 'No saved analysis text for this link.' : 'This case is not saved on this device.'),
       c ? h('a', { class: 'btn', href: `index.html#/c/${encodeURIComponent(c.id)}?tab=${tab}${s.propId ? '&prop=' + encodeURIComponent(s.propId) : ''}` }, 'Open the case ↗') : null));
   }
@@ -829,7 +866,7 @@ function buildFeedback(rev) {
       if (!it.sentences) continue;
       it.sentences.forEach((text, j) => {
         const k = it.sids[j];
-        items.push({ id: k, paragraph: it.id, sentence: j + 1, color: rev.marks[k] || null, text, comment: rev.comments[k] || null, carriedFromPreviousRound: !!rev.carried[k], change: rev.changes[k] || null });
+        items.push({ id: k, paragraph: it.id, sentence: j + 1, color: rev.marks[k] || null, cite: rev.cites?.[k] || null, text, comment: rev.comments[k] || null, carriedFromPreviousRound: !!rev.carried[k], change: rev.changes[k] || null });
       });
     }
     out.push({ section: sec.label, title: sec.title, kind: sec.kind, heading: sec.heading, rating: rev.ratings[sec.label] || null, notes: rev.notes[sec.label] || '', quotedTextChangedFromPreviousRound: !!rev.quoteChanged[sec.label], sentences: items });
@@ -868,15 +905,18 @@ export function buildFeedbackText(rev, { greenText = false, instructions = true 
     L.push('- Preserve GREEN (approved) sentences word-for-word unless a note below specifically requires a change.');
     L.push('- Revise RED sentences. Refine YELLOW sentences. Leave unmarked sentences unchanged unless a note says otherwise.');
     L.push('- Address each section-level note.');
+    L.push('- CITE CHECK: For NEEDS BETTER SUPPORT, strengthen the authority from my research (or bracket [need stronger authority]). For CONFIRM CITE, verify the case, pin cite, quotation, and holding against my saved analyses and the opinion, then fix it or bracket what you could not confirm. CITE CHECKED sentences are confirmed by me: keep their citations exactly and do not bracket them. NO CITE NEEDED: do not add a citation.');
     L.push('- Return the complete updated brief, keeping the same headings and paragraph structure unless a note asks for a change.');
     L.push('');
   }
   L.push('SUMMARY');
   L.push(`Sections rated: ${counted.length - nr(null)}/${counted.length} · Like ${nr('like')} · Mixed ${nr('mixed')} · Revise ${nr('revise')}`);
   L.push(`Sentences: ${all.length} · Green ${n('green')} · Yellow ${n('yellow')} · Red ${n('red')} · Unmarked ${n(null)}`);
+  const nc = (k) => all.filter((x) => x.cite === k).length;
+  if (all.some((x) => x.cite)) L.push(`Cite check: Cite checked ${nc('ok')} · Confirm cite ${nc('confirm')} · Needs better support ${nc('support')} · No cite needed ${nc('none')}`);
 
   for (const sec of fb) {
-    const hasFeedback = sec.rating || sec.notes.trim() || sec.sentences.some((x) => x.color || x.comment);
+    const hasFeedback = sec.rating || sec.notes.trim() || sec.sentences.some((x) => x.color || x.comment || x.cite);
     if (!sec.sentences.length && !hasFeedback) continue;
     if (sec.kind === 'other' && rev.structured && !hasFeedback) continue;
     L.push('');
@@ -917,6 +957,19 @@ export function buildFeedbackText(rev, { greenText = false, instructions = true 
       L.push(`UNMARKED: ${groupByPara(unmarked, sec.section)}`);
       for (const x of unmarked.filter((u) => u.comment)) L.push(`  [${x.id}] “${x.text}”\n      Comment: ${x.comment.replace(/\n/g, ' ')}`);
     }
+    const citeList = (k, title) => {
+      const xs = sec.sentences.filter((x) => x.cite === k);
+      if (!xs.length) return;
+      L.push('');
+      L.push(`${title}:`);
+      for (const x of xs) L.push(`  [${x.id}] “${x.text}”${x.comment ? `\n      Comment: ${x.comment.replace(/\n/g, ' ')}` : ''}`);
+    };
+    citeList('support', 'CITE CHECK — NEEDS BETTER SUPPORT');
+    citeList('confirm', 'CITE CHECK — CONFIRM CITE');
+    const okc = sec.sentences.filter((x) => x.cite === 'ok');
+    if (okc.length) { L.push(''); L.push(`CITE CHECK — CITE CHECKED (confirmed by me; keep these citations, no brackets): ${groupByPara(okc, sec.section)}`); }
+    const noc = sec.sentences.filter((x) => x.cite === 'none');
+    if (noc.length) { L.push(''); L.push(`CITE CHECK — NO CITE NEEDED: ${groupByPara(noc, sec.section)}`); }
   }
   return L.join('\n');
 }

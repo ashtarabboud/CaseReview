@@ -252,3 +252,29 @@ sup.fnref { font-family: var(--sans); font-size: 11px; font-weight: 700; color: 
 .src-card { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 10px 0; }
 .src-ex { white-space: pre-wrap; font-family: var(--serif); font-size: 15px; line-height: 1.5; max-height: 40vh; overflow: auto; margin: 8px 0; }
 .divider { text-align: center; font-size: 13px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin: 22px 0 12px; scroll-margin-top: 110px; }
+
+/* ---------- Cite-check layer (separate from style colors) ---------- */
+:root { --c-ok: #0f766e; --c-confirm: #7c3aed; --c-support: #c2410c; --c-none: #64748b; }
+@media (prefers-color-scheme: dark) { :root { --c-ok: #2dd4bf; --c-confirm: #c4b5fd; --c-support: #fdba74; --c-none: #94a3b8; } }
+.modeswitch { display: flex; width: 100%; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-bottom: 4px; }
+.modeswitch button { flex: 1; font: inherit; font-size: 14px; padding: 8px; border: 0; background: var(--paper); color: var(--ink); cursor: pointer; }
+.modeswitch button + button { border-left: 1px solid var(--line); }
+.modeswitch button[aria-checked="true"] { background: var(--accent); color: var(--accent-ink); font-weight: 650; }
+.tool.cite { background: var(--req-bg); }
+.tool.cite.ok { color: var(--c-ok); } .tool.cite.confirm { color: var(--c-confirm); } .tool.cite.support { color: var(--c-support); } .tool.cite.none { color: var(--c-none); }
+.lg.cite-lg { border: 2px solid; background: transparent; }
+.lg.cite-lg.ok { border-color: var(--c-ok); } .lg.cite-lg.confirm { border-color: var(--c-confirm); border-style: dashed; } .lg.cite-lg.support { border-color: var(--c-support); border-style: double; border-width: 3px; } .lg.cite-lg.none { border-color: var(--c-none); border-style: dotted; }
+.sent[class*="cite-"] { -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+.sent.cite-ok { box-shadow: 0 0 0 2px var(--c-ok); }
+.sent.cite-confirm { box-shadow: 0 0 0 2px var(--c-confirm), 0 0 0 4px color-mix(in srgb, var(--c-confirm) 25%, transparent); }
+.sent.cite-support { box-shadow: 0 0 0 3px var(--c-support); }
+.sent.cite-none { box-shadow: 0 0 0 1.5px var(--c-none); }
+.sent.cite-ok::after { content: " ✔"; color: var(--c-ok); font: 700 12px var(--sans); }
+.sent.cite-confirm::after { content: " ?"; color: var(--c-confirm); font: 700 13px var(--sans); }
+.sent.cite-support::after { content: " +"; color: var(--c-support); font: 700 14px var(--sans); }
+.sent.cite-none::after { content: " ∅"; color: var(--c-none); font: 700 12px var(--sans); }
+.sent.has-comment.cite-ok::after { content: " 💬 ✔"; } .sent.has-comment.cite-confirm::after { content: " 💬 ?"; }
+.sent.has-comment.cite-support::after { content: " 💬 +"; } .sent.has-comment.cite-none::after { content: " 💬 ∅"; }
+.pill.cite-pill { background: transparent; border: 1.5px solid; }
+.pill.cite-pill.ok { border-color: var(--c-ok); color: var(--c-ok); } .pill.cite-pill.confirm { border-color: var(--c-confirm); color: var(--c-confirm); }
+.pill.cite-pill.support { border-color: var(--c-support); color: var(--c-support); } .pill.cite-pill.none { border-color: var(--c-none); color: var(--c-none); }
