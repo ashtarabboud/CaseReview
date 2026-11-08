@@ -10,7 +10,7 @@ import { normMap, findQuote, quotesFromAnalysis, pinAt, mdSection, openDocViewer
 
 /* ============================== Settings ============================== */
 
-const APP_VERSION = '19';
+const APP_VERSION = '20';
 
 const DEFAULT_STYLE = `You are my patient legal research partner. I work in litigation and I find dense case law hard to read and understand. When you explain anything to me:
 
@@ -3444,7 +3444,7 @@ const cap = (t, n) => (t && t.length > n ? t.slice(0, n) + '…' : t || '');
 
 const CHARS_PER_TOKEN = 3.2; // conservative for legal text
 const estTokens = (t) => Math.ceil(String(t || '').length / CHARS_PER_TOKEN);
-const DRAFT_BUDGET_TOKENS = 560000; // system + brief; leaves room for cases Claude opens and for its answer (limit is 1,000,000)
+const DRAFT_BUDGET_TOKENS = 380000; // system + brief; leaves room for cases Claude opens and for its answer (limit is 1,000,000)
 const HL = { yellow: 'important', green: 'helps us', red: 'hurts us', blue: 'the rule' };
 
 /**
@@ -3836,6 +3836,11 @@ async function runDraftJob(p, kind, { version, review, instruction, outEl, opts 
   const cases = await projectCases(p.id);
   draftJob = { pid: p.id, label: kind };
   try {
+    // Whole-brief passes and review revisions run one group of sections at a time (short requests that survive
+    // the phone's dropped connections), saving after each part so Resume can pick up where it stopped.
+    if (kind !== 'first' && !(kind === 'change' && opts.mode === 'targeted')) {
+      return await runChunkedJob(p, kind, { version, review, instruction, outEl, opts, cases });
+    }
     let user;
     if (kind === 'first') {
       user = `Write a complete first draft of my brief.
@@ -3912,6 +3917,129 @@ After </brief>, write "## Notes" with what is still missing ([cite] placeholders
   } finally {
     draftJob = null;
   }
+}
+
+/* ---- Part-by-part drafting jobs ---- */
+
+const JOB_KEY = (pid) => `job:${pid}`;
+const CHUNK_UNITS = 40; // sentences per part (keeps each request short)
+
+/** Group the brief's sections into parts of about CHUNK_UNITS sentences. Returns arrays of section labels. */
+function sectionGroups(blocks, onlyLabels = null) {
+  const { sections } = buildSections(blocks);
+  const groups = [];
+  let cur = [];
+  let n = 0;
+  for (const sec of sections) {
+    if (onlyLabels && !onlyLabels.has(sec.label)) continue;
+    const u = sec.items.reduce((a, it) => a + (it.sentences?.length || 0), 0);
+    if (!u && sec.kind === 'body') continue; // bare topic headings
+    if (cur.length && n + u > CHUNK_UNITS) { groups.push(cur); cur = []; n = 0; }
+    cur.push(sec.label);
+    n += u;
+  }
+  if (cur.length) groups.push(cur);
+  return groups;
+}
+
+/** Sections my review flagged (notes, red/yellow, cite flags, comments). */
+function flaggedSections(review) {
+  const set = new Set();
+  for (const sec of review?.submitted?.feedback || []) {
+    if ((sec.notes || '').trim() || sec.sentences.some((x) => ['red', 'yellow'].includes(x.color) || ['support', 'confirm'].includes(x.cite) || x.comment)) set.add(sec.section);
+  }
+  return set;
+}
+
+function lockedTextsFromReview(rv) {
+  const ids = lockedFromReview(rv);
+  const texts = new Set();
+  if (!rv) return texts;
+  for (const sec of rv.sections) for (const it of sec.items) (it.sids || []).forEach((sid, j) => { if (ids.has(sid)) texts.add(normalize(it.sentences[j])); });
+  return texts;
+}
+
+async function runChunkedJob(p, kind, { version, review, instruction, outEl, opts, cases }) {
+  const status = outEl.closest('.card')?.querySelector('.jobstatus');
+  const say = (t) => { if (status) status.textContent = t; };
+  let st = await db.get('kv', JOB_KEY(p.id));
+  if (!st || st.versionId !== version.id || st.kind !== kind || st.reviewId !== (review?.id || null)) {
+    const only = kind === 'revise' && opts.mode === 'targeted' ? flaggedSections(review) : null;
+    const groups = sectionGroups(version.blocks, only);
+    st = { key: JOB_KEY(p.id), kind, versionId: version.id, reviewId: review?.id || null, opts, instruction: instruction || '', groups, next: 0,
+      blocks: version.blocks, applied: 0, skipped: [], logs: [], suggestions: [], sources: [], recordSources: [], summaries: [], startedAt: Date.now() };
+    await db.put('kv', st);
+  }
+  if (!st.groups.length) throw new Error(kind === 'revise' ? 'Your review didn’t flag anything to revise.' : 'There’s nothing in this brief to work on.');
+  const locked = lockedTextsFromReview(review);
+  const suggest = st.opts.deliver === 'suggest';
+  const fmt = suggest ? SUGGEST_FORMAT : EDIT_FORMAT;
+  const pass = passInstructions(st.opts, kind);
+  const filings = await projectFilings(p.id);
+  const records = await projectRecords(p.id);
+  while (st.next < st.groups.length) {
+    const labels = st.groups[st.next];
+    const partName = `Part ${st.next + 1} of ${st.groups.length}: ${labels[0]}${labels.length > 1 ? ' – ' + labels[labels.length - 1] : ''}`;
+    say(partName);
+    const working = suggest ? version.blocks : st.blocks;
+    const header = `THE CURRENT BRIEF (version ${version.n}${suggest || !st.next ? '' : ', with my earlier parts already revised'}), with ids:\n<brief>\n${labeledBrief(working)}\n</brief>`;
+    const scopeLine = `THIS REQUEST IS PART ${st.next + 1} OF ${st.groups.length}. Work ONLY on these sections: ${labels.join(', ')}. Return ${suggest ? 'suggestions' : 'edits'} only for ids inside them. Read the whole brief for context and consistency; the other sections are handled in their own requests, so don't work on them here.`;
+    let task;
+    if (kind === 'revise') {
+      task = `MY REVIEW FEEDBACK (round ${review.round}):\n<feedback>\n${review.submitted.text}\n</feedback>\n\n${scopeLine}\n${st.opts.mode === 'targeted' ? 'In these sections, revise only what I flagged: RED and YELLOW sentences, cite-check flags, my sentence comments, and my section notes. Leave everything else exactly as it is.' : 'In these sections, address everything I flagged and carry out the pass below.'}`;
+    } else {
+      task = `${st.instruction ? `MY REQUEST: ${st.instruction}\n\n` : ''}${scopeLine}\nCarry out the pass below in these sections.`;
+    }
+    const user = `${header}\n\n${task} Follow my manual. Consider the whole brief.\n\n${pass}\n\n${fmt}`;
+    const fitted = await draftSystem(p, cases, user);
+    const r = await streamInto(outEl, {
+      system: fitted.blocks,
+      messages: [{ role: 'user', content: user }],
+      tools: [CASE_TOOL, ANALYSIS_TOOL, FILING_TOOL, RECORD_TOOL],
+      clientTools: caseTool(cases, filings, records),
+      maxTokens: 32000,
+      onProgress: (phase) => say(`${partName} — ${phase === 'tool' ? 'reading a case or document…' : phase === 'resume' ? 'connection dropped, picking up where it left off…' : phase === 'retry' ? 'reconnecting…' : 'writing…'}`),
+    });
+    const json = lastJSON(r.text) || {};
+    if (suggest) {
+      if (!Array.isArray(json.suggestions)) throw new Error(`Part ${st.next + 1}: Claude’s reply didn’t include a list of suggestions. Tap Resume to retry this part.`);
+      st.suggestions.push(...json.suggestions);
+      st.summaries.push(`### ${labels.join(', ')}\n${stripJSONBlocks(r.text)}`);
+    } else {
+      if (!Array.isArray(json.edits)) throw new Error(`Part ${st.next + 1}: Claude’s reply didn’t include a list of edits. Tap Resume to retry this part.`);
+      const lockedIds = new Set([...units(buildSections(st.blocks))].filter((u) => locked.has(normalize(u.text))).map((u) => u.id));
+      const res = applyEdits(st.blocks, json.edits, { locked: lockedIds });
+      st.blocks = res.blocks;
+      st.applied += res.applied;
+      st.skipped.push(...res.skipped);
+      st.logs.push(`### ${labels.join(', ')}\n${stripJSONBlocks(r.text)}`);
+    }
+    st.sources.push(...(json.sources || []));
+    st.recordSources.push(...(json.record_sources || []));
+    st.next++;
+    await db.put('kv', st);
+  }
+  await db.del('kv', st.key);
+  if (suggest) {
+    const fresh = await db.get('versions', version.id);
+    fresh.suggestions = {
+      at: Date.now(), kind, opts: st.opts, fromReviewId: review?.id || null, instruction: st.instruction,
+      summary: st.summaries.join('\n\n'),
+      items: st.suggestions.filter((x) => x && x.id).map((x) => ({ key: uid(), id: String(x.id).replace(/^\[|\]$/g, ''), type: x.type || 'accuracy', comment: x.comment || '', replacement: x.replacement || '', decision: null })),
+      sources: st.sources, recordSources: st.recordSources,
+    };
+    await db.put('versions', fresh);
+    if (review) { review.suggestedOn = version.id; await db.put('reviews', review); }
+    return { suggestedOn: fresh };
+  }
+  const v = await saveVersion(p, cases, {
+    source: kind === 'revise' ? 'claude-revision' : 'claude-change',
+    parentId: version.id, fromReviewId: review?.id || null, instruction: st.instruction, passOpts: st.opts,
+    blocks: st.blocks, changeLog: st.logs.join('\n\n'), applied: st.applied, skipped: st.skipped,
+    claudeSources: st.sources, claudeRecordSources: st.recordSources,
+  });
+  if (review) { review.revisedVersionId = v.id; await db.put('reviews', review); }
+  return v;
 }
 
 /* ============================== Draft tab ============================== */
@@ -3993,10 +4121,31 @@ async function draftTab(main, p, q) {
       }
     } catch (e) {
       jobCard.querySelector('.jobstatus').textContent = 'Stopped';
-      jobOut.append(h('div', { class: 'err' }, '⚠️ ' + friendlyError(e)));
+      const st = await db.get('kv', JOB_KEY(p.id));
+      jobOut.append(h('div', { class: 'err' }, '⚠️ ' + friendlyError(e)),
+        st ? h('div', { class: 'row', style: 'margin-top:8px' },
+          h('span', { class: 'small grow' }, `${st.next} of ${st.groups.length} parts are saved.`),
+          h('button', { class: 'btn primary slim', onclick: () => resumeJob(st) }, `▶ Resume at part ${st.next + 1}`)) : null);
       jobCard.querySelector('.spin')?.remove();
     }
   };
+  const resumeJob = async (st) => {
+    const version = await db.get('versions', st.versionId);
+    const review = st.reviewId ? await db.get('reviews', st.reviewId) : null;
+    if (!version) { await db.del('kv', st.key); return route(); }
+    jobOut.replaceChildren();
+    if (!jobCard.querySelector('.spin')) jobCard.querySelector('.row')?.prepend(h('span', { class: 'spin' }));
+    run(st.kind, { version, review, instruction: st.instruction, opts: st.opts });
+  };
+  const pendingJob = await db.get('kv', JOB_KEY(p.id));
+  if (pendingJob && !draftJob) {
+    main.append(h('div', { class: 'card banner' },
+      h('strong', {}, '⏸ A drafting job stopped partway. '),
+      `${pendingJob.next} of ${pendingJob.groups.length} parts are done and saved.`,
+      h('div', { class: 'row', style: 'margin-top:8px' },
+        h('button', { class: 'btn primary slim', onclick: () => resumeJob(pendingJob) }, `▶ Resume at part ${pendingJob.next + 1}`),
+        h('button', { class: 'btn slim', onclick: async () => { if (!confirm('Discard the saved parts of this job?')) return; await db.del('kv', pendingJob.key); route(); } }, 'Discard'))));
+  }
 
   if (!vs.length) {
     main.append(h('div', { class: 'card stack' },
